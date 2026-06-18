@@ -594,7 +594,7 @@ with st.sidebar:
 # TAB 1: COMPARATIVA EVA vs MODELACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["📊 Comparativa EVA vs Modelación", "🔍 Visualizador y Proyección de Modelación"])
+tab1, tab2, tab3 = st.tabs(["📊 Comparativa EVA vs Modelación", "🔍 Visualizador y Proyección de Modelación", "🗓️ Proyección 2027 (Todos los CC)"])
 
 with tab1:
     st.header("Comparativa EVA vs Modelación")
@@ -1117,5 +1117,242 @@ with tab2:
             
         except Exception as e:
             st.error(f"Error al procesar la proyección: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3: PROYECCIÓN 2027 — TODOS LOS CC
+# ─────────────────────────────────────────────────────────────────────────────
+
+MESES_ES_NOMBRES = {
+    1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
+    7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
+}
+
+with tab3:
+    st.header("Proyección 2027 — Todos los Centros de Costo")
+    st.write(
+        "Genera la proyección completa de enero a diciembre 2027 para **todos los CC** "
+        "usando la misma lógica del Visualizador. El resultado se puede exportar a Excel como Modelación Proyectada 2027."
+    )
+
+    st.subheader("1. Seleccionar Modelación Base")
+    if archivos_repo:
+        mod_sel_tab3 = st.selectbox(
+            "Elige la modelación base:",
+            options=["Seleccionar..."] + archivos_repo,
+            key="mod_sel_tab3"
+        )
+    else:
+        st.warning("Sube un archivo en la barra lateral.")
+        mod_sel_tab3 = "Seleccionar..."
+
+    if mod_sel_tab3 != "Seleccionar...":
+        try:
+            with st.spinner("Calculando proyecciones 2027 para todos los centros de costo..."):
+                path_mod_t3 = os.path.join(REPO_DIR, mod_sel_tab3)
+                df_base_t3 = pd.read_excel(path_mod_t3)
+
+                df_base_t3['CC'] = df_base_t3['CC'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                df_base_t3['Nombre Cliente'] = df_base_t3['Nombre Cliente'].astype(str).str.strip().str.upper()
+                df_base_t3['Variable'] = df_base_t3['Variable'].astype(str).str.strip()
+
+                mapping_vars_t3 = {
+                    'Costo Alimento': 'Costo',
+                    'Gasto Manipulación': 'Manipulación',
+                    'Gasto Fijo': 'Fijo',
+                    'Gasto Variable': 'Variable',
+                    'Margen de Contribución': 'Margen'
+                }
+                df_base_t3['Variable'] = df_base_t3['Variable'].replace(mapping_vars_t3)
+
+                excluded_t3 = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
+                month_cols_t3 = [c for c in df_base_t3.columns if c not in excluded_t3]
+
+                ccs_all_t3 = df_base_t3['CC'].drop_duplicates().tolist()
+                year_proy_2027 = 2027
+                meses_2027 = [pd.Timestamp(year=2027, month=m, day=1) for m in range(1, 13)]
+                meses_2027_str = [f"{m:02d}-2027" for m in range(1, 13)]
+
+                filas_excel_t3 = []
+                filas_resumen_t3 = []
+
+                for cc in ccs_all_t3:
+                    df_cc = df_base_t3[df_base_t3['CC'] == cc].copy()
+                    nombre_cc = df_cc['Nombre Cliente'].iloc[0] if not df_cc.empty else "DESCONOCIDO"
+
+                    df_melt_cc = pd.melt(
+                        df_cc,
+                        id_vars=['CC', 'Nombre Cliente', 'Variable'],
+                        value_vars=month_cols_t3,
+                        var_name='Mes',
+                        value_name='Valor'
+                    )
+                    df_melt_cc['Valor'] = pd.to_numeric(df_melt_cc['Valor'], errors='coerce').fillna(0)
+
+                    try:
+                        df_melt_cc['Fecha'] = pd.to_datetime(df_melt_cc['Mes'], format='%m-%Y', errors='coerce')
+                        mask_cc = df_melt_cc['Fecha'].isna()
+                        if mask_cc.any():
+                            df_melt_cc.loc[mask_cc, 'Fecha'] = pd.to_datetime(df_melt_cc.loc[mask_cc, 'Mes'], errors='coerce')
+                    except Exception:
+                        df_melt_cc['Fecha'] = pd.to_datetime(df_melt_cc['Mes'], errors='coerce')
+
+                    fechas_cc = sorted(df_melt_cc['Fecha'].dropna().unique())
+                    if not fechas_cc:
+                        continue
+                    year_base_cc = fechas_cc[0].year
+
+                    mod_pivot_cc = df_melt_cc.pivot_table(
+                        index='Variable', columns='Fecha', values='Valor', aggfunc='sum'
+                    ).fillna(0)
+
+                    var_venta_cc = next((v for v in mod_pivot_cc.index if is_venta(v)), 'Venta')
+
+                    tiene_temp_cc, meses_temp_cc = detectar_temporalidad(mod_pivot_cc, var_venta_cc)
+                    var_pct_cc, var_abs_cc = calcular_variacion_oct_dic(mod_pivot_cc, var_venta_cc)
+
+                    col_dic_cc = next((c for c in mod_pivot_cc.columns if c.month == 12), None)
+                    if col_dic_cc is not None:
+                        val_fijo_dic_cc = float(mod_pivot_cc.at['Fijo', col_dic_cc]) if 'Fijo' in mod_pivot_cc.index else 0.0
+                        val_manip_dic_cc = float(mod_pivot_cc.at['Manipulación', col_dic_cc]) if 'Manipulación' in mod_pivot_cc.index else 0.0
+                        _vd = float(mod_pivot_cc.at[var_venta_cc, col_dic_cc]) if var_venta_cc in mod_pivot_cc.index and mod_pivot_cc.at[var_venta_cc, col_dic_cc] > 0 else 1.0
+                        pct_costo_dic_cc = safe_div(float(mod_pivot_cc.at['Costo', col_dic_cc]) if 'Costo' in mod_pivot_cc.index else 0.0, _vd)
+                        pct_var_dic_cc = safe_div(float(mod_pivot_cc.at['Variable', col_dic_cc]) if 'Variable' in mod_pivot_cc.index else 0.0, _vd)
+                    else:
+                        _vp = float(mod_pivot_cc.loc[var_venta_cc].mean()) if var_venta_cc in mod_pivot_cc.index and mod_pivot_cc.loc[var_venta_cc].mean() > 0 else 1.0
+                        val_fijo_dic_cc = float(mod_pivot_cc.loc['Fijo'].mean()) if 'Fijo' in mod_pivot_cc.index else 0.0
+                        val_manip_dic_cc = float(mod_pivot_cc.loc['Manipulación'].mean()) if 'Manipulación' in mod_pivot_cc.index else 0.0
+                        pct_costo_dic_cc = safe_div(float(mod_pivot_cc.loc['Costo'].mean()) if 'Costo' in mod_pivot_cc.index else 0.0, _vp)
+                        pct_var_dic_cc = safe_div(float(mod_pivot_cc.loc['Variable'].mean()) if 'Variable' in mod_pivot_cc.index else 0.0, _vp)
+
+                    valores_cc = {v: {} for v in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']}
+
+                    for d in meses_2027:
+                        valores_cc['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
+
+                        venta_p = proyectar_venta(
+                            mod_pivot=mod_pivot_cc,
+                            var_venta=var_venta_cc,
+                            mes_num=d.month,
+                            year_base=year_base_cc,
+                            year_proy=year_proy_2027,
+                            tiene_temporalidad=tiene_temp_cc,
+                            meses_con_temporalidad=meses_temp_cc,
+                            variacion_pct_oct_dic=var_pct_cc,
+                            variacion_abs_oct_dic=var_abs_cc,
+                            aumento_extra_pct=0.0
+                        )
+                        valores_cc['Venta'][d] = venta_p
+
+                        costos_tot = 0.0
+                        for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                            val_p = proyectar_costos(
+                                mod_pivot=mod_pivot_cc,
+                                var=var_c,
+                                venta_proyectada=venta_p,
+                                mes_num=d.month,
+                                tiene_temporalidad=tiene_temp_cc,
+                                val_fijo_diciembre=val_fijo_dic_cc,
+                                val_manipulacion_diciembre=val_manip_dic_cc,
+                                pct_costo_diciembre=pct_costo_dic_cc,
+                                pct_variable_diciembre=pct_var_dic_cc
+                            )
+                            valores_cc[var_c][d] = val_p
+                            costos_tot += val_p
+
+                        valores_cc['Margen'][d] = venta_p - costos_tot
+
+                    # Filas para Excel (formato compatible con plantilla original)
+                    for var in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen']:
+                        fila_exc = {'CC': cc, 'Nombre Cliente': nombre_cc, 'Tipo Modelo': 'PROYECCIÓN 2027', 'Variable': var}
+                        for d, ms in zip(meses_2027, meses_2027_str):
+                            fila_exc[ms] = round(valores_cc[var][d], 2)
+                        fila_exc['TOTAL'] = round(sum(valores_cc[var][d] for d in meses_2027), 2)
+                        filas_excel_t3.append(fila_exc)
+
+                    # Fila de días hábiles para Excel
+                    fila_dias_exc = {'CC': cc, 'Nombre Cliente': nombre_cc, 'Tipo Modelo': 'PROYECCIÓN 2027', 'Variable': 'Días Hábiles'}
+                    for d, ms in zip(meses_2027, meses_2027_str):
+                        fila_dias_exc[ms] = int(valores_cc['Días Hábiles'][d])
+                    fila_dias_exc['TOTAL'] = int(sum(valores_cc['Días Hábiles'][d] for d in meses_2027))
+                    filas_excel_t3.append(fila_dias_exc)
+
+                    # Fila resumen para display
+                    total_v = sum(valores_cc['Venta'][d] for d in meses_2027)
+                    total_c = sum(valores_cc['Costo'][d] for d in meses_2027)
+                    total_m_val = sum(valores_cc['Manipulación'][d] for d in meses_2027)
+                    total_f = sum(valores_cc['Fijo'][d] for d in meses_2027)
+                    total_var = sum(valores_cc['Variable'][d] for d in meses_2027)
+                    total_mg = sum(valores_cc['Margen'][d] for d in meses_2027)
+                    filas_resumen_t3.append({
+                        'CC': cc,
+                        'Nombre Cliente': nombre_cc,
+                        'Venta 2027': round(total_v, 0),
+                        'Costo 2027': round(total_c, 0),
+                        'Manipulación 2027': round(total_m_val, 0),
+                        'Fijo 2027': round(total_f, 0),
+                        'Variable 2027': round(total_var, 0),
+                        'Margen 2027': round(total_mg, 0),
+                        'MC %': f"{safe_div(total_mg, total_v):.1%}",
+                        'Temporalidad': 'Sí' if tiene_temp_cc else 'No'
+                    })
+
+            if filas_excel_t3:
+                df_proy_2027_excel = pd.DataFrame(filas_excel_t3)
+                df_resumen_2027 = pd.DataFrame(filas_resumen_t3)
+
+                st.success(f"Proyección 2027 lista para {len(ccs_all_t3)} centros de costo.")
+
+                # ── Tabla resumen ejecutivo ──
+                st.markdown("### 📊 Resumen Anual por Casino — 2027")
+                st.dataframe(
+                    df_resumen_2027.set_index('CC'),
+                    use_container_width=True
+                )
+
+                # ── Detalle por CC (expandibles) ──
+                st.markdown("### 📋 Detalle Mes a Mes por Casino")
+                vars_detalle = ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']
+
+                for cc in ccs_all_t3:
+                    df_cc_det = df_proy_2027_excel[
+                        (df_proy_2027_excel['CC'] == cc) &
+                        (df_proy_2027_excel['Variable'].isin(vars_detalle))
+                    ].copy()
+                    if df_cc_det.empty:
+                        continue
+                    nombre_det = df_cc_det['Nombre Cliente'].iloc[0]
+                    with st.expander(f"📍 {cc} — {nombre_det}"):
+                        cols_show = ['Variable'] + meses_2027_str + ['TOTAL']
+                        df_det_view = df_cc_det[cols_show].set_index('Variable')
+                        df_det_view['Variable'] = pd.Categorical(
+                            df_det_view.index, categories=vars_detalle, ordered=True
+                        )
+                        df_det_view = df_det_view.reindex(vars_detalle)
+                        st.dataframe(df_det_view, use_container_width=True)
+
+                # ── Exportar ──
+                st.markdown("---")
+                output_t3 = io.BytesIO()
+                with pd.ExcelWriter(output_t3, engine='openpyxl') as writer:
+                    # Hoja principal compatible con formato de modelación
+                    df_proy_2027_excel.to_excel(writer, index=False, sheet_name='Modelación Proyectada 2027')
+                    # Hoja de resumen ejecutivo
+                    df_resumen_2027.to_excel(writer, index=False, sheet_name='Resumen Ejecutivo 2027')
+
+                st.download_button(
+                    label="📥 Descargar Modelación Proyectada 2027 (Excel)",
+                    data=output_t3.getvalue(),
+                    file_name="Modelacion_Proyectada_2027.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_dl_excel_tab3"
+                )
+            else:
+                st.warning("No se encontraron datos procesables en la modelación seleccionada.")
+
+        except Exception as e:
+            st.error(f"Error al calcular proyección 2027: {e}")
             import traceback
             st.code(traceback.format_exc())
