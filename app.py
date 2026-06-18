@@ -1264,6 +1264,17 @@ with tab3:
 
                         valores_cc['Margen'][d] = venta_p - costos_tot
 
+                    # Filtrar CC sin datos (todos los totales financieros en cero)
+                    total_v = sum(valores_cc['Venta'][d] for d in meses_2027)
+                    total_c = sum(valores_cc['Costo'][d] for d in meses_2027)
+                    total_m_val = sum(valores_cc['Manipulación'][d] for d in meses_2027)
+                    total_f = sum(valores_cc['Fijo'][d] for d in meses_2027)
+                    total_var = sum(valores_cc['Variable'][d] for d in meses_2027)
+                    total_mg = sum(valores_cc['Margen'][d] for d in meses_2027)
+
+                    if abs(total_v) + abs(total_c) + abs(total_m_val) + abs(total_f) + abs(total_var) + abs(total_mg) == 0:
+                        continue
+
                     # Filas para Excel (formato compatible con plantilla original)
                     for var in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen']:
                         fila_exc = {'CC': cc, 'Nombre Cliente': nombre_cc, 'Tipo Modelo': 'PROYECCIÓN 2027', 'Variable': var}
@@ -1280,12 +1291,6 @@ with tab3:
                     filas_excel_t3.append(fila_dias_exc)
 
                     # Fila resumen para display
-                    total_v = sum(valores_cc['Venta'][d] for d in meses_2027)
-                    total_c = sum(valores_cc['Costo'][d] for d in meses_2027)
-                    total_m_val = sum(valores_cc['Manipulación'][d] for d in meses_2027)
-                    total_f = sum(valores_cc['Fijo'][d] for d in meses_2027)
-                    total_var = sum(valores_cc['Variable'][d] for d in meses_2027)
-                    total_mg = sum(valores_cc['Margen'][d] for d in meses_2027)
                     filas_resumen_t3.append({
                         'CC': cc,
                         'Nombre Cliente': nombre_cc,
@@ -1303,7 +1308,8 @@ with tab3:
                 df_proy_2027_excel = pd.DataFrame(filas_excel_t3)
                 df_resumen_2027 = pd.DataFrame(filas_resumen_t3)
 
-                st.success(f"Proyección 2027 lista para {len(ccs_all_t3)} centros de costo.")
+                ccs_con_datos = df_resumen_2027['CC'].tolist()
+                st.success(f"Proyección 2027 lista — {len(ccs_con_datos)} casinos con datos.")
 
                 # ── Tabla resumen ejecutivo ──
                 st.markdown("### 📊 Resumen Anual por Casino — 2027")
@@ -1312,11 +1318,39 @@ with tab3:
                     use_container_width=True
                 )
 
-                # ── Detalle por CC (expandibles) ──
+                # ── Detalle por CC con buscador y límite de 10 ──
                 st.markdown("### 📋 Detalle Mes a Mes por Casino")
                 vars_detalle = ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']
 
-                for cc in ccs_all_t3:
+                busqueda_t3 = st.text_input(
+                    "Buscar casino por CC o Nombre:",
+                    placeholder="Escribe el código CC o parte del nombre...",
+                    key="busqueda_det_t3"
+                )
+
+                termino = busqueda_t3.strip().lower()
+                if termino:
+                    ccs_filtrados = [
+                        cc for cc in ccs_con_datos
+                        if termino in cc.lower() or termino in df_resumen_2027.loc[
+                            df_resumen_2027['CC'] == cc, 'Nombre Cliente'
+                        ].iloc[0].lower()
+                    ]
+                else:
+                    ccs_filtrados = ccs_con_datos
+
+                LIMITE_DETALLE = 10
+                ccs_mostrar = ccs_filtrados[:LIMITE_DETALLE]
+
+                if len(ccs_filtrados) > LIMITE_DETALLE:
+                    st.info(
+                        f"Mostrando {LIMITE_DETALLE} de {len(ccs_filtrados)} casinos. "
+                        "Usa el buscador para filtrar por CC o nombre."
+                    )
+                elif len(ccs_filtrados) == 0:
+                    st.warning("No se encontraron casinos que coincidan con la búsqueda.")
+
+                for cc in ccs_mostrar:
                     df_cc_det = df_proy_2027_excel[
                         (df_proy_2027_excel['CC'] == cc) &
                         (df_proy_2027_excel['Variable'].isin(vars_detalle))
@@ -1327,9 +1361,6 @@ with tab3:
                     with st.expander(f"📍 {cc} — {nombre_det}"):
                         cols_show = ['Variable'] + meses_2027_str + ['TOTAL']
                         df_det_view = df_cc_det[cols_show].set_index('Variable')
-                        df_det_view['Variable'] = pd.Categorical(
-                            df_det_view.index, categories=vars_detalle, ordered=True
-                        )
                         df_det_view = df_det_view.reindex(vars_detalle)
                         st.dataframe(df_det_view, use_container_width=True)
 
