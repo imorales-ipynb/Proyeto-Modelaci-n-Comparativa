@@ -77,6 +77,18 @@ def get_dias_habiles(year, month):
 def safe_div(n, d):
     return n / d if d and d != 0 else 0
 
+def get_col_referencia(mod_pivot, var_venta):
+    """Último mes con datos reales de Venta Y Costo (prefiere Diciembre si tiene datos)."""
+    if var_venta not in mod_pivot.index:
+        return None
+    cols_con_venta = [c for c in mod_pivot.columns if mod_pivot.at[var_venta, c] > 0]
+    if not cols_con_venta:
+        return None
+    cols_con_costo = [c for c in cols_con_venta if 'Costo' in mod_pivot.index and mod_pivot.at['Costo', c] > 0]
+    candidatos = cols_con_costo if cols_con_costo else cols_con_venta
+    col_dic = next((c for c in candidatos if c.month == 12), None)
+    return col_dic if col_dic is not None else max(candidatos)
+
 def is_venta(var_name):
     return 'venta' in str(var_name).lower()
 
@@ -256,20 +268,20 @@ def proyectar_costos(mod_pivot, var, venta_proyectada, mes_num,
             return 0.0
     else:
         # Con temporalidad: usar el % o valor absoluto del mes correspondiente
-        if col_mes is not None and var in mod_pivot.index:
+        var_venta_key = next((v for v in mod_pivot.index if is_venta(v)), None)
+        venta_mes_real = float(mod_pivot.at[var_venta_key, col_mes]) if (col_mes is not None and var_venta_key and var_venta_key in mod_pivot.index) else 0.0
+
+        if col_mes is not None and var in mod_pivot.index and venta_mes_real > 0:
             val_mes = float(mod_pivot.at[var, col_mes])
             if es_fijo_o_manip:
-                return val_mes
+                return val_mes if val_mes != 0 else (val_fijo_diciembre if 'fijo' in var_lower else val_manipulacion_diciembre)
             elif es_proporcional:
-                # Calcular % sobre venta real del mes
-                var_venta_key = next((v for v in mod_pivot.index if is_venta(v)), None)
-                venta_mes_real = float(mod_pivot.at[var_venta_key, col_mes]) if var_venta_key else 0.0
                 pct_mes = safe_div(val_mes, venta_mes_real)
                 return pct_mes * venta_proyectada
             else:
                 return val_mes
         else:
-            # Fallback a Diciembre si no hay dato del mes
+            # Fallback al mes de referencia cuando el mes base no tiene datos reales
             if 'fijo' in var_lower:
                 return val_fijo_diciembre
             elif 'manipulación' in var_lower or 'manipulacion' in var_lower:
@@ -391,8 +403,8 @@ def process_data(df):
         tiene_temporalidad, meses_con_temporalidad = detectar_temporalidad(mod_pivot_raw, var_venta)
         variacion_pct_oct_dic, variacion_abs_oct_dic = calcular_variacion_oct_dic(mod_pivot_raw, var_venta)
 
-        # ── Valores de referencia de Diciembre (para lógica sin temporalidad) ──
-        col_diciembre = next((c for c in mod_pivot_raw.columns if c.month == 12), None)
+        # ── Valores de referencia (último mes con datos reales, preferentemente Diciembre) ──
+        col_diciembre = get_col_referencia(mod_pivot_raw, var_venta)
         if col_diciembre is not None:
             val_fijo_dic = float(mod_pivot_raw.at['Fijo', col_diciembre]) if 'Fijo' in mod_pivot_raw.index else 0.0
             val_manip_dic = float(mod_pivot_raw.at['Manipulación', col_diciembre]) if 'Manipulación' in mod_pivot_raw.index else 0.0
@@ -877,20 +889,21 @@ with tab2:
             tiene_temporalidad, meses_con_temporalidad = detectar_temporalidad(mod_pivot, var_venta)
             variacion_pct_oct_dic, variacion_abs_oct_dic = calcular_variacion_oct_dic(mod_pivot, var_venta)
 
-            # ── Valores de referencia de Diciembre ──
-            col_diciembre = next((c for c in mod_pivot.columns if c.month == 12), None)
+            # ── Valores de referencia (último mes con datos reales) ──
+            col_diciembre = get_col_referencia(mod_pivot, var_venta)
             if col_diciembre is not None:
-                val_fijo_diciembre = mod_pivot.at['Fijo', col_diciembre] if 'Fijo' in mod_pivot.index else 0.0
-                val_manipulacion_diciembre = mod_pivot.at['Manipulación', col_diciembre] if 'Manipulación' in mod_pivot.index else 0.0
-                venta_diciembre = mod_pivot.at[var_venta, col_diciembre] if var_venta in mod_pivot.index and mod_pivot.at[var_venta, col_diciembre] > 0 else 1.0
-                pct_costo_diciembre = safe_div(mod_pivot.at['Costo', col_diciembre] if 'Costo' in mod_pivot.index else 0.0, venta_diciembre)
-                pct_variable_diciembre = safe_div(mod_pivot.at['Variable', col_diciembre] if 'Variable' in mod_pivot.index else 0.0, venta_diciembre)
+                val_fijo_diciembre = float(mod_pivot.at['Fijo', col_diciembre]) if 'Fijo' in mod_pivot.index else 0.0
+                val_manipulacion_diciembre = float(mod_pivot.at['Manipulación', col_diciembre]) if 'Manipulación' in mod_pivot.index else 0.0
+                venta_diciembre = float(mod_pivot.at[var_venta, col_diciembre]) if var_venta in mod_pivot.index and mod_pivot.at[var_venta, col_diciembre] > 0 else 1.0
+                pct_costo_diciembre = safe_div(float(mod_pivot.at['Costo', col_diciembre]) if 'Costo' in mod_pivot.index else 0.0, venta_diciembre)
+                pct_variable_diciembre = safe_div(float(mod_pivot.at['Variable', col_diciembre]) if 'Variable' in mod_pivot.index else 0.0, venta_diciembre)
             else:
                 val_fijo_diciembre = mod_pivot.loc['Fijo'].mean() if 'Fijo' in mod_pivot.index else 0.0
                 val_manipulacion_diciembre = mod_pivot.loc['Manipulación'].mean() if 'Manipulación' in mod_pivot.index else 0.0
                 venta_promedio = mod_pivot.loc[var_venta].mean() if var_venta in mod_pivot.index and mod_pivot.loc[var_venta].mean() > 0 else 1.0
                 pct_costo_diciembre = safe_div(mod_pivot.loc['Costo'].mean() if 'Costo' in mod_pivot.index else 0.0, venta_promedio)
                 pct_variable_diciembre = safe_div(mod_pivot.loc['Variable'].mean() if 'Variable' in mod_pivot.index else 0.0, venta_promedio)
+            mes_ref_nombre = MESES_ES.get(col_diciembre.month, 'referencia') if col_diciembre is not None else 'promedio'
 
             # ── Mostrar bloque de temporalidad ──
             st.markdown("### 📅 Análisis de Temporalidad")
@@ -903,7 +916,7 @@ with tab2:
                 st.caption(
                     f"📐 **Lógica de proyección:** Sin temporalidad → Venta diaria base de Octubre con variación promedio Oct-Dic "
                     f"(**{variacion_pct_display:+.2%}** | **${variacion_abs_display:+,.0f}/día**), multiplicada por días hábiles del mes. "
-                    f"Costos referenciados a **Diciembre** — Fijo: **${val_fijo_diciembre:,.0f}**, "
+                    f"Costos referenciados a **{mes_ref_nombre}** — Fijo: **${val_fijo_diciembre:,.0f}**, "
                     f"Manipulación: **${val_manipulacion_diciembre:,.0f}**, "
                     f"Costo: **{pct_costo_diciembre:.2%}**, Variable: **{pct_variable_diciembre:.2%}**."
                 )
@@ -1213,7 +1226,7 @@ with tab3:
                     tiene_temp_cc, meses_temp_cc = detectar_temporalidad(mod_pivot_cc, var_venta_cc)
                     var_pct_cc, var_abs_cc = calcular_variacion_oct_dic(mod_pivot_cc, var_venta_cc)
 
-                    col_dic_cc = next((c for c in mod_pivot_cc.columns if c.month == 12), None)
+                    col_dic_cc = get_col_referencia(mod_pivot_cc, var_venta_cc)
                     if col_dic_cc is not None:
                         val_fijo_dic_cc = float(mod_pivot_cc.at['Fijo', col_dic_cc]) if 'Fijo' in mod_pivot_cc.index else 0.0
                         val_manip_dic_cc = float(mod_pivot_cc.at['Manipulación', col_dic_cc]) if 'Manipulación' in mod_pivot_cc.index else 0.0
