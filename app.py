@@ -8,6 +8,11 @@ from datetime import date
 
 st.set_page_config(page_title="Comparativa EVA vs Modelación", layout="wide", page_icon="📊")
 
+MESES_ES_NOMBRES = {
+    1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
+    7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
+}
+
 @st.cache_data
 def get_template_excel(tipo):
     if tipo == 'EVA':
@@ -695,7 +700,7 @@ with tab1:
 
     if mod_seleccionada != "Seleccionar..." and uploaded_eva is not None:
         try:
-            # ── Carga y pre-scan (ligero, se ejecuta en cada interacción) ──
+            # ── 1. Carga de archivos (cacheado en session_state, solo se reprocesa si cambian) ──
             files_key = f"{mod_seleccionada}_{uploaded_eva.name}_{uploaded_eva.size}"
             if st.session_state.get('tab1_files_key') != files_key:
                 path_mod_t1 = os.path.join(REPO_DIR, mod_seleccionada)
@@ -705,55 +710,41 @@ with tab1:
                 st.session_state['tab1_files_key'] = files_key
                 st.session_state['tab1_df_combined'] = _df_combined
                 st.session_state['tab1_temp_info'] = prescan_temporalidades(_df_combined)
+                # Limpiar checkboxes y resultados cuando cambian los archivos
+                for k in [k for k in st.session_state if k.startswith('temp_t1_')]:
+                    del st.session_state[k]
+                st.session_state.pop('tab1_results_key', None)
                 st.session_state.pop('tab1_results', None)
 
             df_combined_t1 = st.session_state['tab1_df_combined']
             temp_info_t1 = st.session_state['tab1_temp_info']
-
-            # ── Configuración de temporalidad ──
             ccs_con_temp = {cc: info for cc, info in temp_info_t1.items() if info['tiene']}
+
+            # ── 2. Leer valores actuales de checkboxes desde session_state (antes de renderizarlos) ──
             overrides_t1 = {}
+            for cc, info in ccs_con_temp.items():
+                meses_excl = set()
+                for mes_num in info['meses']:
+                    if not st.session_state.get(f"temp_t1_{cc}_{mes_num}", True):
+                        meses_excl.add(mes_num)
+                if meses_excl:
+                    overrides_t1[cc] = meses_excl
 
-            if ccs_con_temp:
-                st.markdown("### ⚙️ Configuración de Temporalidad")
-                st.caption("Marca/desmarca los meses para aplicar o ignorar la temporalidad detectada en cada casino.")
-                with st.expander(f"Temporalidades detectadas en {len(ccs_con_temp)} casino(s) — haz clic para configurar", expanded=True):
-                    for cc, info in ccs_con_temp.items():
-                        meses_ord = sorted(info['meses'].items())
-                        st.markdown(f"**{info['nombre']} (CC: {cc})**")
-                        n_cols = min(len(meses_ord), 4)
-                        cols_temp = st.columns(n_cols)
-                        meses_excl = set()
-                        for i, (mes_num, pct) in enumerate(meses_ord):
-                            with cols_temp[i % n_cols]:
-                                usar = st.checkbox(
-                                    f"{MESES_ES_NOMBRES.get(mes_num, str(mes_num))} ({pct:+.1%})",
-                                    value=True,
-                                    key=f"temp_t1_{cc}_{mes_num}"
-                                )
-                                if not usar:
-                                    meses_excl.add(mes_num)
-                        if meses_excl:
-                            overrides_t1[cc] = meses_excl
-                        st.write("")
-                st.markdown("---")
-
-            # ── Botón de cálculo ──
-            if st.button("🔄 Generar Comparativa", key="btn_generar_t1", type="primary"):
+            # ── 3. Procesar solo si cambió la combinación archivos+overrides ──
+            overrides_key = str(sorted([(cc, sorted(m)) for cc, m in overrides_t1.items()]))
+            results_key = f"{files_key}__{overrides_key}"
+            if st.session_state.get('tab1_results_key') != results_key:
                 with st.spinner("Procesando archivos e infiriendo estacionalidad..."):
-                    df_mensual_t1, df_resumen_t1, error_t1 = process_data(df_combined_t1, overrides_t1)
-                if error_t1:
-                    st.error(error_t1)
-                    st.session_state.pop('tab1_results', None)
-                else:
-                    st.session_state['tab1_results'] = (df_mensual_t1, df_resumen_t1)
+                    _dm, _dr, _err = process_data(df_combined_t1, overrides_t1)
+                st.session_state['tab1_results_key'] = results_key
+                st.session_state['tab1_results'] = (_dm, _dr, _err)
 
-            if 'tab1_results' not in st.session_state:
-                if not ccs_con_temp:
-                    st.info("Archivos listos. Haz clic en **Generar Comparativa** para procesar.")
+            df_mensual, df_resumen, error = st.session_state['tab1_results']
 
-            if 'tab1_results' in st.session_state:
-                df_mensual, df_resumen = st.session_state['tab1_results']
+            if error:
+                st.error(error)
+            else:
+                # ── 4. Mostrar resultados ──
                 st.markdown("### Resumen Anualizado por Cliente")
                 
                 desired_order = ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']
@@ -773,7 +764,23 @@ with tab1:
                         row.get('Tiene Temporalidad', False),
                         row.get('Meses con Temporalidad', {})
                     )
-                    
+
+                    # ── Ajuste de temporalidad (solo si tiene temporalidad) ──
+                    cc_this = str(row['CC'])
+                    if cc_this in ccs_con_temp:
+                        info_temp = ccs_con_temp[cc_this]
+                        meses_ord_temp = sorted(info_temp['meses'].items())
+                        st.caption("Desmarca los meses que no quieres tratar como temporales. La comparativa recalcula al instante.")
+                        n_cols_t = min(len(meses_ord_temp), 4)
+                        cols_t = st.columns(n_cols_t)
+                        for i_t, (mes_num_t, pct_t) in enumerate(meses_ord_temp):
+                            with cols_t[i_t % n_cols_t]:
+                                st.checkbox(
+                                    f"{MESES_ES_NOMBRES.get(mes_num_t, str(mes_num_t))} ({pct_t:+.1%})",
+                                    value=True,
+                                    key=f"temp_t1_{cc_this}_{mes_num_t}"
+                                )
+
                     st.caption(f"🗓️ **Período Analizado:** 12 Meses | **Días Hábiles Totales:** {row['Total Días Hábiles (12m)']} días")
                     
                     st.markdown("##### 💰 Resumen de Totales Anualizados")
@@ -890,7 +897,7 @@ with tab1:
                     df_pct_view['Variable'] = pd.Categorical(df_pct_view['Variable'], categories=desired_order_pct, ordered=True)
                     df_pct_view = df_pct_view.sort_values(['Variable', 'Tipo Modelo']).dropna(subset=['Variable']).reset_index(drop=True)
                     st.dataframe(df_pct_view.drop(columns=['CC', 'Nombre Cliente']).set_index(['Variable', 'Tipo Modelo']), use_container_width=True)
-                    
+
                 st.markdown("---")
                 
                 output = io.BytesIO()
@@ -906,7 +913,7 @@ with tab1:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="btn_dl_full_excel_tab1"
                 )
-                
+
         except Exception as e:
             st.error(f"Error al procesar la comparativa: {e}")
 
@@ -1245,11 +1252,6 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 3: PROYECCIÓN 2027 — TODOS LOS CC
 # ─────────────────────────────────────────────────────────────────────────────
-
-MESES_ES_NOMBRES = {
-    1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
-    7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
-}
 
 with tab3:
     st.header("Proyección 2027 — Todos los Centros de Costo")
