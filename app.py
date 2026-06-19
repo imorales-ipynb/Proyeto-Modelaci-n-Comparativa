@@ -178,7 +178,7 @@ def calcular_variacion_oct_dic(mod_pivot, var_venta):
 def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
                     tiene_temporalidad, meses_con_temporalidad,
                     variacion_pct_oct_dic, variacion_abs_oct_dic,
-                    aumento_extra_pct=0.0):
+                    aumento_extra_pct=0.0, meses_excluidos_temp=None):
     """
     Devuelve la venta proyectada para (mes_num, year_proy) ajustada por días hábiles.
 
@@ -210,6 +210,10 @@ def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
     diferencia = 0.0
     if v_octubre_diaria != 0 and v_base_diaria != 0:
         diferencia = (v_base_diaria - v_octubre_diaria) / abs(v_octubre_diaria)
+
+    # Si el usuario excluyó este mes de la temporalidad, forzar rama estándar
+    if meses_excluidos_temp and mes_num in meses_excluidos_temp:
+        diferencia = 0.0
 
     if abs(diferencia) > 0.20:
         # Temporalidad detectada en este mes → usar valor proporcional de la modelación escalado a los días de proyección
@@ -316,10 +320,55 @@ def render_temporalidad_info(tiene_temporalidad, meses_con_temporalidad):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PRE-SCAN: detección de temporalidades sin proyección completa
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prescan_temporalidades(df):
+    """Detecta temporalidades por CC sin realizar proyección. Devuelve {cc: {nombre, tiene, meses}}."""
+    required = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
+    if any(c not in df.columns for c in required):
+        return {}
+
+    df = df.copy()
+    month_cols = [c for c in df.columns if c not in required]
+    df['CC'] = df['CC'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    df['Nombre Cliente'] = df['Nombre Cliente'].astype(str).str.strip().str.upper()
+    df['Tipo Modelo'] = df['Tipo Modelo'].astype(str).str.strip().str.upper().replace('MODELACIÓN', 'MODELACION')
+    df['Variable'] = df['Variable'].astype(str).str.strip().replace({
+        'Costo Alimento': 'Costo', 'Gasto Manipulación': 'Manipulación',
+        'Gasto Fijo': 'Fijo', 'Gasto Variable': 'Variable', 'Margen de Contribución': 'Margen'
+    })
+
+    df_melt = pd.melt(df, id_vars=required, value_vars=month_cols, var_name='Mes', value_name='Valor')
+    df_melt['Valor'] = pd.to_numeric(df_melt['Valor'], errors='coerce').fillna(0)
+    try:
+        df_melt['Fecha'] = pd.to_datetime(df_melt['Mes'], format='%m-%Y', errors='coerce')
+        mask = df_melt['Fecha'].isna()
+        if mask.any():
+            df_melt.loc[mask, 'Fecha'] = pd.to_datetime(df_melt.loc[mask, 'Mes'], errors='coerce')
+    except Exception:
+        df_melt['Fecha'] = pd.to_datetime(df_melt['Mes'], errors='coerce')
+
+    df_mod = df_melt[df_melt['Tipo Modelo'].isin(['MODELACION', 'INTERNO'])].copy()
+    resultado = {}
+    for cc in df_mod['CC'].drop_duplicates():
+        mod_cc = df_mod[df_mod['CC'] == cc]
+        nombre = mod_cc['Nombre Cliente'].iloc[0] if not mod_cc.empty else cc
+        mod_pivot = mod_cc.pivot_table(index='Variable', columns='Fecha', values='Valor', aggfunc='sum').fillna(0)
+        var_venta = next((v for v in mod_pivot.index if is_venta(v)), None)
+        if var_venta:
+            tiene, meses = detectar_temporalidad(mod_pivot, var_venta)
+        else:
+            tiene, meses = False, {}
+        resultado[cc] = {'nombre': nombre, 'tiene': tiene, 'meses': meses}
+    return resultado
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PROCESAMIENTO PRINCIPAL (Tab 1: EVA vs Modelación)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_data(df):
+def process_data(df, overrides_temporalidad=None):
     required_cols = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
     for col in required_cols:
         if col not in df.columns:
@@ -403,6 +452,13 @@ def process_data(df):
         tiene_temporalidad, meses_con_temporalidad = detectar_temporalidad(mod_pivot_raw, var_venta)
         variacion_pct_oct_dic, variacion_abs_oct_dic = calcular_variacion_oct_dic(mod_pivot_raw, var_venta)
 
+        # ── Aplicar overrides de temporalidad del usuario ──
+        meses_excluidos_cc = overrides_temporalidad.get(cc, set()) if overrides_temporalidad else set()
+        if meses_excluidos_cc:
+            for m_exc in meses_excluidos_cc:
+                meses_con_temporalidad.pop(m_exc, None)
+            tiene_temporalidad = len(meses_con_temporalidad) > 0
+
         # ── Valores de referencia (último mes con datos reales, preferentemente Diciembre) ──
         col_diciembre = get_col_referencia(mod_pivot_raw, var_venta)
         if col_diciembre is not None:
@@ -436,6 +492,7 @@ def process_data(df):
                         mod_12m.at[var, d] = mod_pivot_raw.at[var, d]
             else:
                 # ── PROYECCIÓN CON NUEVA LÓGICA ──
+                usar_temp_mes = tiene_temporalidad and d.month not in meses_excluidos_cc
                 if var_venta:
                     venta_proyectada = proyectar_venta(
                         mod_pivot=mod_pivot_raw,
@@ -443,11 +500,12 @@ def process_data(df):
                         mes_num=d.month,
                         year_base=year_base_mod,
                         year_proy=d.year,
-                        tiene_temporalidad=tiene_temporalidad,
+                        tiene_temporalidad=usar_temp_mes,
                         meses_con_temporalidad=meses_con_temporalidad,
                         variacion_pct_oct_dic=variacion_pct_oct_dic,
                         variacion_abs_oct_dic=variacion_abs_oct_dic,
-                        aumento_extra_pct=0.0
+                        aumento_extra_pct=0.0,
+                        meses_excluidos_temp=meses_excluidos_cc
                     )
                     mod_12m.at[var_venta, d] = venta_proyectada
                 else:
@@ -462,7 +520,7 @@ def process_data(df):
                         var=var,
                         venta_proyectada=venta_proyectada,
                         mes_num=d.month,
-                        tiene_temporalidad=tiene_temporalidad,
+                        tiene_temporalidad=usar_temp_mes,
                         val_fijo_diciembre=val_fijo_dic,
                         val_manipulacion_diciembre=val_manip_dic,
                         pct_costo_diciembre=pct_costo_dic,
@@ -637,15 +695,65 @@ with tab1:
 
     if mod_seleccionada != "Seleccionar..." and uploaded_eva is not None:
         try:
-            with st.spinner("Procesando archivos e infiriendo estacionalidad..."):
-                path_mod = os.path.join(REPO_DIR, mod_seleccionada)
-                df_mod_raw = pd.read_excel(path_mod)
-                df_eva_raw = pd.read_excel(uploaded_eva)
-                df = pd.concat([df_mod_raw, df_eva_raw], ignore_index=True)
-                df_mensual, df_resumen, error = process_data(df)
-            if error:
-                st.error(error)
-            else:
+            # ── Carga y pre-scan (ligero, se ejecuta en cada interacción) ──
+            files_key = f"{mod_seleccionada}_{uploaded_eva.name}_{uploaded_eva.size}"
+            if st.session_state.get('tab1_files_key') != files_key:
+                path_mod_t1 = os.path.join(REPO_DIR, mod_seleccionada)
+                _df_mod = pd.read_excel(path_mod_t1)
+                _df_eva = pd.read_excel(uploaded_eva)
+                _df_combined = pd.concat([_df_mod, _df_eva], ignore_index=True)
+                st.session_state['tab1_files_key'] = files_key
+                st.session_state['tab1_df_combined'] = _df_combined
+                st.session_state['tab1_temp_info'] = prescan_temporalidades(_df_combined)
+                st.session_state.pop('tab1_results', None)
+
+            df_combined_t1 = st.session_state['tab1_df_combined']
+            temp_info_t1 = st.session_state['tab1_temp_info']
+
+            # ── Configuración de temporalidad ──
+            ccs_con_temp = {cc: info for cc, info in temp_info_t1.items() if info['tiene']}
+            overrides_t1 = {}
+
+            if ccs_con_temp:
+                st.markdown("### ⚙️ Configuración de Temporalidad")
+                st.caption("Marca/desmarca los meses para aplicar o ignorar la temporalidad detectada en cada casino.")
+                with st.expander(f"Temporalidades detectadas en {len(ccs_con_temp)} casino(s) — haz clic para configurar", expanded=True):
+                    for cc, info in ccs_con_temp.items():
+                        meses_ord = sorted(info['meses'].items())
+                        st.markdown(f"**{info['nombre']} (CC: {cc})**")
+                        n_cols = min(len(meses_ord), 4)
+                        cols_temp = st.columns(n_cols)
+                        meses_excl = set()
+                        for i, (mes_num, pct) in enumerate(meses_ord):
+                            with cols_temp[i % n_cols]:
+                                usar = st.checkbox(
+                                    f"{MESES_ES_NOMBRES.get(mes_num, str(mes_num))} ({pct:+.1%})",
+                                    value=True,
+                                    key=f"temp_t1_{cc}_{mes_num}"
+                                )
+                                if not usar:
+                                    meses_excl.add(mes_num)
+                        if meses_excl:
+                            overrides_t1[cc] = meses_excl
+                        st.write("")
+                st.markdown("---")
+
+            # ── Botón de cálculo ──
+            if st.button("🔄 Generar Comparativa", key="btn_generar_t1", type="primary"):
+                with st.spinner("Procesando archivos e infiriendo estacionalidad..."):
+                    df_mensual_t1, df_resumen_t1, error_t1 = process_data(df_combined_t1, overrides_t1)
+                if error_t1:
+                    st.error(error_t1)
+                    st.session_state.pop('tab1_results', None)
+                else:
+                    st.session_state['tab1_results'] = (df_mensual_t1, df_resumen_t1)
+
+            if 'tab1_results' not in st.session_state:
+                if not ccs_con_temp:
+                    st.info("Archivos listos. Haz clic en **Generar Comparativa** para procesar.")
+
+            if 'tab1_results' in st.session_state:
+                df_mensual, df_resumen = st.session_state['tab1_results']
                 st.markdown("### Resumen Anualizado por Cliente")
                 
                 desired_order = ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']
