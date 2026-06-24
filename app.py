@@ -208,7 +208,8 @@ def calcular_variacion_oct_dic(mod_pivot, var_venta):
 def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
                     tiene_temporalidad, meses_con_temporalidad,
                     variacion_pct_oct_dic, variacion_abs_oct_dic,
-                    aumento_extra_pct=0.0, meses_excluidos_temp=None):
+                    aumento_extra_pct=0.0, meses_excluidos_temp=None,
+                    ultimo_mes_real=12):
     """
     Devuelve la venta proyectada para (mes_num, year_proy) ajustada por días hábiles.
 
@@ -217,6 +218,12 @@ def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
       - Si |diferencia_diaria| > 20%  → usar el valor proporcional del mes de la modelación.
       - Si |diferencia_diaria| <= 20% → usar venta mensual de octubre + variación oct-dic.
     """
+    # No proyectar más allá del último mes con datos reales
+    if year_proy > year_base and ultimo_mes_real < 12:
+        return 0.0
+    if year_proy == year_base and ultimo_mes_real > 0 and mes_num > ultimo_mes_real:
+        return 0.0
+
     col_octubre = next((c for c in mod_pivot.columns if c.month == 10), None)
     col_mes_base = next((c for c in mod_pivot.columns if c.month == mes_num), None)
 
@@ -330,6 +337,15 @@ def proyectar_costos(mod_pivot, var, venta_proyectada, mes_num,
                 return pct_variable_diciembre * venta_proyectada
             else:
                 return 0.0
+
+
+def _ultimo_mes_real(mod_pivot, var_venta, year_base):
+    """Último mes (1-12) de year_base con venta > 0. Devuelve 12 si no hay datos."""
+    if var_venta is None or var_venta not in mod_pivot.index:
+        return 12
+    cols_yr = [c for c in mod_pivot.columns
+               if c.year == year_base and float(mod_pivot.at[var_venta, c]) > 0]
+    return max((c.month for c in cols_yr), default=12)
 
 
 def render_temporalidad_info(tiene_temporalidad, meses_con_temporalidad):
@@ -493,6 +509,7 @@ def process_data(df, overrides_temporalidad=None):
         # ── Detección de temporalidad para este CC ──
         tiene_temporalidad, meses_con_temporalidad = detectar_temporalidad(mod_pivot_raw, var_venta)
         variacion_pct_oct_dic, variacion_abs_oct_dic = calcular_variacion_oct_dic(mod_pivot_raw, var_venta)
+        ultimo_mes_real_mod = _ultimo_mes_real(mod_pivot_raw, var_venta, year_base_mod)
 
         # ── Aplicar overrides de temporalidad del usuario ──
         meses_excluidos_cc = overrides_temporalidad.get(cc, set()) if overrides_temporalidad else set()
@@ -547,32 +564,41 @@ def process_data(df, overrides_temporalidad=None):
                         variacion_pct_oct_dic=variacion_pct_oct_dic,
                         variacion_abs_oct_dic=variacion_abs_oct_dic,
                         aumento_extra_pct=0.0,
-                        meses_excluidos_temp=meses_excluidos_cc
+                        meses_excluidos_temp=meses_excluidos_cc,
+                        ultimo_mes_real=ultimo_mes_real_mod
                     )
                     mod_12m.at[var_venta, d] = venta_proyectada
                 else:
                     venta_proyectada = 0.0
 
                 costos_gastos = 0.0
-                for var in variables:
-                    if var == var_venta or var == var_margen:
-                        continue
-                    val_proy = proyectar_costos(
-                        mod_pivot=mod_pivot_raw,
-                        var=var,
-                        venta_proyectada=venta_proyectada,
-                        mes_num=d.month,
-                        tiene_temporalidad=usar_temp_mes,
-                        val_fijo_diciembre=val_fijo_dic,
-                        val_manipulacion_diciembre=val_manip_dic,
-                        pct_costo_diciembre=pct_costo_dic,
-                        pct_variable_diciembre=pct_variable_dic
-                    )
-                    mod_12m.at[var, d] = val_proy
-                    costos_gastos += val_proy
+                if venta_proyectada == 0:
+                    for var in variables:
+                        if var == var_venta or var == var_margen:
+                            continue
+                        mod_12m.at[var, d] = 0.0
+                    if var_margen:
+                        mod_12m.at[var_margen, d] = 0.0
+                else:
+                    for var in variables:
+                        if var == var_venta or var == var_margen:
+                            continue
+                        val_proy = proyectar_costos(
+                            mod_pivot=mod_pivot_raw,
+                            var=var,
+                            venta_proyectada=venta_proyectada,
+                            mes_num=d.month,
+                            tiene_temporalidad=usar_temp_mes,
+                            val_fijo_diciembre=val_fijo_dic,
+                            val_manipulacion_diciembre=val_manip_dic,
+                            pct_costo_diciembre=pct_costo_dic,
+                            pct_variable_diciembre=pct_variable_dic
+                        )
+                        mod_12m.at[var, d] = val_proy
+                        costos_gastos += val_proy
 
-                if var_margen:
-                    mod_12m.at[var_margen, d] = venta_proyectada - costos_gastos
+                    if var_margen:
+                        mod_12m.at[var_margen, d] = venta_proyectada - costos_gastos
 
         # ── CÁLCULO DE PORCENTAJES Y DIFERENCIALES ──
         for tipo, df_datos in [('EVA', eva_12m), ('Modelación Ajustada', mod_12m)]:
@@ -1041,6 +1067,7 @@ with tab2:
 
             tiene_temporalidad, meses_con_temporalidad = detectar_temporalidad(mod_pivot, var_venta)
             variacion_pct_oct_dic, variacion_abs_oct_dic = calcular_variacion_oct_dic(mod_pivot, var_venta)
+            ultimo_mes_real_viz = _ultimo_mes_real(mod_pivot, var_venta, year_base)
 
             # ── Valores de referencia (último mes con datos reales) ──
             col_diciembre = get_col_referencia(mod_pivot, var_venta)
@@ -1178,28 +1205,34 @@ with tab2:
                         meses_con_temporalidad=meses_con_temporalidad,
                         variacion_pct_oct_dic=variacion_pct_oct_dic,
                         variacion_abs_oct_dic=variacion_abs_oct_dic,
-                        aumento_extra_pct=aumento_auto
+                        aumento_extra_pct=aumento_auto,
+                        ultimo_mes_real=ultimo_mes_real_viz
                     )
                     df_proyeccion.at['Venta', d] = venta_proyectada
 
                     # Costos con nueva lógica
                     costos_totales = 0.0
-                    for var in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
-                        val_proy = proyectar_costos(
-                            mod_pivot=mod_pivot,
-                            var=var,
-                            venta_proyectada=venta_proyectada,
-                            mes_num=d.month,
-                            tiene_temporalidad=tiene_temporalidad,
-                            val_fijo_diciembre=val_fijo_diciembre,
-                            val_manipulacion_diciembre=val_manipulacion_diciembre,
-                            pct_costo_diciembre=pct_costo_diciembre,
-                            pct_variable_diciembre=pct_variable_diciembre
-                        )
-                        df_proyeccion.at[var, d] = val_proy
-                        costos_totales += val_proy
+                    if venta_proyectada == 0:
+                        for var in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                            df_proyeccion.at[var, d] = 0.0
+                        df_proyeccion.at['Margen', d] = 0.0
+                    else:
+                        for var in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                            val_proy = proyectar_costos(
+                                mod_pivot=mod_pivot,
+                                var=var,
+                                venta_proyectada=venta_proyectada,
+                                mes_num=d.month,
+                                tiene_temporalidad=tiene_temporalidad,
+                                val_fijo_diciembre=val_fijo_diciembre,
+                                val_manipulacion_diciembre=val_manipulacion_diciembre,
+                                pct_costo_diciembre=pct_costo_diciembre,
+                                pct_variable_diciembre=pct_variable_diciembre
+                            )
+                            df_proyeccion.at[var, d] = val_proy
+                            costos_totales += val_proy
 
-                    df_proyeccion.at['Margen', d] = venta_proyectada - costos_totales
+                        df_proyeccion.at['Margen', d] = venta_proyectada - costos_totales
 
             # ── Formatear para display ──
             df_proy_disp = df_proyeccion.copy()
@@ -1374,6 +1407,7 @@ with tab3:
 
                     tiene_temp_cc, meses_temp_cc = detectar_temporalidad(mod_pivot_cc, var_venta_cc)
                     var_pct_cc, var_abs_cc = calcular_variacion_oct_dic(mod_pivot_cc, var_venta_cc)
+                    ultimo_mes_real_cc = _ultimo_mes_real(mod_pivot_cc, var_venta_cc, year_base_cc)
 
                     col_dic_cc = get_col_referencia(mod_pivot_cc, var_venta_cc)
                     if col_dic_cc is not None:
@@ -1404,27 +1438,33 @@ with tab3:
                             meses_con_temporalidad=meses_temp_cc,
                             variacion_pct_oct_dic=var_pct_cc,
                             variacion_abs_oct_dic=var_abs_cc,
-                            aumento_extra_pct=0.0
+                            aumento_extra_pct=0.0,
+                            ultimo_mes_real=ultimo_mes_real_cc
                         )
                         valores_cc['Venta'][d] = venta_p
 
                         costos_tot = 0.0
-                        for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
-                            val_p = proyectar_costos(
-                                mod_pivot=mod_pivot_cc,
-                                var=var_c,
-                                venta_proyectada=venta_p,
-                                mes_num=d.month,
-                                tiene_temporalidad=tiene_temp_cc,
-                                val_fijo_diciembre=val_fijo_dic_cc,
-                                val_manipulacion_diciembre=val_manip_dic_cc,
-                                pct_costo_diciembre=pct_costo_dic_cc,
-                                pct_variable_diciembre=pct_var_dic_cc
-                            )
-                            valores_cc[var_c][d] = val_p
-                            costos_tot += val_p
+                        if venta_p == 0:
+                            for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                valores_cc[var_c][d] = 0.0
+                            valores_cc['Margen'][d] = 0.0
+                        else:
+                            for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                val_p = proyectar_costos(
+                                    mod_pivot=mod_pivot_cc,
+                                    var=var_c,
+                                    venta_proyectada=venta_p,
+                                    mes_num=d.month,
+                                    tiene_temporalidad=tiene_temp_cc,
+                                    val_fijo_diciembre=val_fijo_dic_cc,
+                                    val_manipulacion_diciembre=val_manip_dic_cc,
+                                    pct_costo_diciembre=pct_costo_dic_cc,
+                                    pct_variable_diciembre=pct_var_dic_cc
+                                )
+                                valores_cc[var_c][d] = val_p
+                                costos_tot += val_p
 
-                        valores_cc['Margen'][d] = venta_p - costos_tot
+                            valores_cc['Margen'][d] = venta_p - costos_tot
 
                     # Filtrar CC sin datos (todos los totales financieros en cero)
                     total_v = sum(valores_cc['Venta'][d] for d in meses_2027)
@@ -1434,7 +1474,7 @@ with tab3:
                     total_var = sum(valores_cc['Variable'][d] for d in meses_2027)
                     total_mg = sum(valores_cc['Margen'][d] for d in meses_2027)
 
-                    if abs(total_v) + abs(total_c) + abs(total_m_val) + abs(total_f) + abs(total_var) + abs(total_mg) == 0:
+                    if total_v == 0:
                         continue
 
                     # Filas para Excel (formato compatible con plantilla original)
@@ -1763,6 +1803,7 @@ with tab4:
                         continue
                     tiene_temp_n, meses_temp_n = detectar_temporalidad(mod_pivot_n, var_venta_n)
                     var_pct_n, var_abs_n = calcular_variacion_oct_dic(mod_pivot_n, var_venta_n)
+                    ultimo_mes_real_n = _ultimo_mes_real(mod_pivot_n, var_venta_n, year_base_n)
                     for d in meses_next_dates:
                         venta_cc_mes_next[(cc_n, d.month)] = proyectar_venta(
                             mod_pivot=mod_pivot_n,
@@ -1774,7 +1815,8 @@ with tab4:
                             meses_con_temporalidad=meses_temp_n,
                             variacion_pct_oct_dic=var_pct_n,
                             variacion_abs_oct_dic=var_abs_n,
-                            aumento_extra_pct=0.0
+                            aumento_extra_pct=0.0,
+                            ultimo_mes_real=ultimo_mes_real_n
                         )
 
                 # Costo CC 138 desde la modelación
@@ -1940,6 +1982,8 @@ with tab4:
 
                 for cc_t in ccs_trans:
                     v_cc   = venta_cc_mes.get((cc_t, mes_n), 0.0)
+                    if v_cc == 0:
+                        continue
                     refac  = refac_cc_mes.get((cc_t, mes_n), 0.0)
                     v_net  = v_cc - refac
                     pct_cc = pct_ucp.get((cc_t, mes_n), pct_ref_cc.get(cc_t, 0.0)) if not es_proy else pct_ref_cc.get(cc_t, 0.0)
@@ -1997,6 +2041,8 @@ with tab4:
 
                 for cc_t in ccs_trans:
                     v_cc   = venta_cc_mes_next.get((cc_t, mes_n), 0.0)
+                    if v_cc == 0:
+                        continue
                     refac  = refac_cc_mes_next.get((cc_t, mes_n), 0.0)
                     v_net  = v_cc - refac
                     pct_cc = pct_ref_cc.get(cc_t, 0.0)
