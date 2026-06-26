@@ -137,6 +137,10 @@ def detectar_temporalidad(mod_pivot, var_venta, umbral=0.20):
     Devuelve:
       - tiene_temporalidad (bool)
       - meses_con_temporalidad (dict {mes_num: pct_diferencia})
+
+    Regla de arranque: si existen meses con venta = 0 ANTES del primer mes con
+    venta > 0 (ceros de inicio / casino en arranque), el casino NO tiene
+    temporalidad → se proyecta todo desde Octubre.
     """
     col_octubre = next((c for c in mod_pivot.columns if c.month == 10), None)
     if col_octubre is None or var_venta not in mod_pivot.index:
@@ -152,17 +156,34 @@ def detectar_temporalidad(mod_pivot, var_venta, umbral=0.20):
     if v_diaria_oct == 0:
         return False, {}
 
+    # ── Regla de arranque ──────────────────────────────────────────────────────
+    # Si hay meses con venta = 0 ANTES del primer mes con venta > 0, el casino
+    # está en período de inicio/apertura: no se evalúa temporalidad y toda la
+    # proyección sigue la lógica estándar de Octubre.
+    cols_ordenadas = sorted(mod_pivot.columns)
+    primer_mes_activo = next(
+        (c for c in cols_ordenadas if float(mod_pivot.at[var_venta, c]) > 0), None
+    )
+    if primer_mes_activo is not None:
+        ceros_previos = [
+            c for c in cols_ordenadas
+            if c < primer_mes_activo and float(mod_pivot.at[var_venta, c]) <= 0
+        ]
+        if ceros_previos:
+            return False, {}
+    # ──────────────────────────────────────────────────────────────────────────
+
     meses_temp = {}
     for col in mod_pivot.columns:
         venta_mes = mod_pivot.at[var_venta, col]
-        if venta_mes == 0:
+        if venta_mes <= 0:
             continue
-            
+
         dias_mes = get_dias_habiles(col.year, col.month)
         v_diaria_mes = safe_div(venta_mes, dias_mes)
-        
+
         diferencia = (v_diaria_mes - v_diaria_oct) / abs(v_diaria_oct)
-        
+
         if abs(diferencia) > umbral:
             meses_temp[col.month] = diferencia
 
@@ -243,14 +264,33 @@ def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
         dias_oct_real = get_dias_habiles(col_octubre.year, 10)
         v_octubre_diaria = safe_div(venta_octubre, dias_oct_real)
 
-    # Decidir qué valor base usar
-    diferencia = 0.0
-    if v_octubre_diaria != 0 and v_base_diaria != 0:
-        diferencia = (v_base_diaria - v_octubre_diaria) / abs(v_octubre_diaria)
+    # ── Caso especial: mes sin venta en la modelación base ──
+    # Si el casino no tenía operación ese mes (todo en 0), no corresponde usar
+    # temporalidad. Se proyecta directamente con la lógica estándar de Octubre,
+    # igual que cualquier mes normal sin estacionalidad.
+    if venta_base_raw <= 0:
+        dias_proy = get_dias_habiles(year_proy, mes_num)
+        if v_octubre_diaria != 0:
+            if variacion_pct_oct_dic > 0:
+                v_proy_pct = v_octubre_diaria * (1 + variacion_pct_oct_dic)
+                v_proy_abs = v_octubre_diaria + variacion_abs_oct_dic
+                venta_diaria_final = (v_proy_pct + v_proy_abs) / 2
+            else:
+                venta_diaria_final = v_octubre_diaria
+        else:
+            venta_diaria_final = 0.0
+        return venta_diaria_final * dias_proy * (1.0 + aumento_extra_pct)
+
+    # ── Caso normal: mes con datos reales en la modelación base ──
+    mes_es_temporal = mes_num in meses_con_temporalidad
 
     # Si el usuario excluyó este mes de la temporalidad, forzar rama estándar
     if meses_excluidos_temp and mes_num in meses_excluidos_temp:
-        diferencia = 0.0
+        mes_es_temporal = False
+
+    diferencia = 0.0
+    if mes_es_temporal and v_octubre_diaria != 0 and v_base_diaria != 0:
+        diferencia = (v_base_diaria - v_octubre_diaria) / abs(v_octubre_diaria)
 
     if abs(diferencia) > 0.20:
         # Temporalidad: usar valor proporcional del mes de la modelación + 4% (inflación/reajuste año móvil)
@@ -268,7 +308,7 @@ def proyectar_venta(mod_pivot, var_venta, mes_num, year_base, year_proy,
                 venta_diaria_final = v_octubre_diaria
         else:
             venta_diaria_final = 0.0
-            
+
         dias_proy = get_dias_habiles(year_proy, mes_num)
         venta_proyectada = venta_diaria_final * dias_proy
 
@@ -551,7 +591,11 @@ def process_data(df, overrides_temporalidad=None):
                         mod_12m.at[var, d] = mod_pivot_raw.at[var, d]
             else:
                 # ── PROYECCIÓN CON NUEVA LÓGICA ──
-                usar_temp_mes = tiene_temporalidad and d.month not in meses_excluidos_cc
+                # Verificar si el mes base tiene venta en la modelación
+                _col_base_t1 = next((c for c in mod_pivot_raw.columns if c.month == d.month), None)
+                _venta_base_t1 = float(mod_pivot_raw.at[var_venta, _col_base_t1]) if (_col_base_t1 is not None and var_venta and var_venta in mod_pivot_raw.index) else 0.0
+                # Meses sin venta base no se tratan como temporales → usan lógica de Octubre
+                usar_temp_mes = tiene_temporalidad and d.month not in meses_excluidos_cc and _venta_base_t1 > 0
                 if var_venta:
                     venta_proyectada = proyectar_venta(
                         mod_pivot=mod_pivot_raw,
@@ -1193,7 +1237,13 @@ with tab2:
                     df_proyeccion.at['Margen', d] = df_proyeccion.at['Venta', d] - costos_reales
                 else:
                     tipo_mes_list.append("Proyectado")
-                    
+
+                    # Verificar si el mes base tiene venta en la modelación
+                    _col_base_t2 = next((c for c in mod_pivot.columns if c.month == d.month), None)
+                    _venta_base_t2 = float(mod_pivot.at[var_venta, _col_base_t2]) if (_col_base_t2 is not None and var_venta in mod_pivot.index) else 0.0
+                    # Meses sin venta base → no se consideran temporales para costos
+                    _tiene_temp_t2 = tiene_temporalidad and _venta_base_t2 > 0
+
                     # Venta con nueva lógica
                     venta_proyectada = proyectar_venta(
                         mod_pivot=mod_pivot,
@@ -1223,7 +1273,7 @@ with tab2:
                                 var=var,
                                 venta_proyectada=venta_proyectada,
                                 mes_num=d.month,
-                                tiene_temporalidad=tiene_temporalidad,
+                                tiene_temporalidad=_tiene_temp_t2,
                                 val_fijo_diciembre=val_fijo_diciembre,
                                 val_manipulacion_diciembre=val_manipulacion_diciembre,
                                 pct_costo_diciembre=pct_costo_diciembre,
@@ -1428,6 +1478,11 @@ with tab3:
                     for d in meses_2027:
                         valores_cc['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
 
+                        # Verificar si el mes base tiene venta → si no, no es temporal
+                        _col_base_t3 = next((c for c in mod_pivot_cc.columns if c.month == d.month), None)
+                        _venta_base_t3 = float(mod_pivot_cc.at[var_venta_cc, _col_base_t3]) if (_col_base_t3 is not None and var_venta_cc in mod_pivot_cc.index) else 0.0
+                        _tiene_temp_t3 = tiene_temp_cc and _venta_base_t3 > 0
+
                         venta_p = proyectar_venta(
                             mod_pivot=mod_pivot_cc,
                             var_venta=var_venta_cc,
@@ -1455,7 +1510,7 @@ with tab3:
                                     var=var_c,
                                     venta_proyectada=venta_p,
                                     mes_num=d.month,
-                                    tiene_temporalidad=tiene_temp_cc,
+                                    tiene_temporalidad=_tiene_temp_t3,
                                     val_fijo_diciembre=val_fijo_dic_cc,
                                     val_manipulacion_diciembre=val_manip_dic_cc,
                                     pct_costo_diciembre=pct_costo_dic_cc,
