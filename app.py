@@ -1808,6 +1808,10 @@ with tab4:
             meses_reales_ucp = sorted(df_anio['FECHA'].dt.month.unique().tolist())
             meses_proy_ucp   = sorted(set(range(1, 13)) - set(meses_reales_ucp))
 
+            # Mes de referencia (último mes real del UCP) — se usa tanto para el % Costo/Venta
+            # de los meses proyectados como para el arrastre de la Refacturación (mismo criterio para todos los CC).
+            mes_ref = 12 if 12 in meses_reales_ucp else (max(meses_reales_ucp) if meses_reales_ucp else None)
+
             agg = (
                 df_anio.groupby(['CC', 'FECHA'])
                 .agg(COSTO_SUM=('COSTO', 'sum'), VENTA_SUM=('VENTA', 'sum'))
@@ -2035,23 +2039,25 @@ with tab4:
                         df_rm['CC'] = df_rm[cc_col_r].apply(_norm_cc)
                         df_rm['MES_NUM'] = df_rm['Fecha'].dt.month
 
-                        def _fill_refac_yr(df_yr):
+                        def _fill_refac_yr(df_yr, mes_referencia):
                             result = {}
                             if df_yr.empty:
                                 return result
                             base = df_yr.groupby(['CC', 'MES_NUM'])['Refac'].sum()
                             for cc_r in base.index.get_level_values('CC').unique():
                                 meses_dato = base[cc_r].to_dict()
-                                ultimo_m   = max(meses_dato.keys())
-                                val_ult    = meses_dato[ultimo_m]
+                                if mes_referencia is not None and mes_referencia in meses_dato:
+                                    val_ult = meses_dato[mes_referencia]
+                                else:
+                                    val_ult = meses_dato[max(meses_dato.keys())]
                                 for m in range(1, 13):
                                     result[(cc_r, m)] = meses_dato.get(m, val_ult)
                             return result
 
                         refac_cc_mes = _fill_refac_yr(
-                            df_rm[df_rm['Fecha'].dt.year == year_ucp]
+                            df_rm[df_rm['Fecha'].dt.year == year_ucp], mes_ref
                         )
-                        _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next])
+                        _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next], mes_ref)
                         if _rn:
                             refac_cc_mes_next = _rn
                         else:
@@ -2069,7 +2075,6 @@ with tab4:
                     pass  # sin hoja Refacturación → refac = 0 para todos
 
             # ── 4. % de referencia para meses sin dato en el Excel UCP ──
-            mes_ref = 12 if 12 in meses_reales_ucp else (max(meses_reales_ucp) if meses_reales_ucp else None)
             nombre_mes_ref = MESES_ES_NOMBRES.get(mes_ref, str(mes_ref)) if mes_ref else '—'
 
             pct_ref_cc = {cc_t: pct_ucp.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans} if mes_ref else {}
