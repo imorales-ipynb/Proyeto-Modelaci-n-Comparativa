@@ -2039,7 +2039,10 @@ with tab4:
                         df_rm['CC'] = df_rm[cc_col_r].apply(_norm_cc)
                         df_rm['MES_NUM'] = df_rm['Fecha'].dt.month
 
-                        def _fill_refac_yr(df_yr, mes_referencia):
+                        def _fill_refac_yr(df_yr, mes_referencia, meses_reales):
+                            # Meses "reales" usan el dato de la hoja si existe; meses "proyectados"
+                            # SIEMPRE replican el valor del mes de referencia, aunque la hoja ya
+                            # traiga (otro) valor cargado para ese mes.
                             result = {}
                             if df_yr.empty:
                                 return result
@@ -2047,17 +2050,22 @@ with tab4:
                             for cc_r in base.index.get_level_values('CC').unique():
                                 meses_dato = base[cc_r].to_dict()
                                 if mes_referencia is not None and mes_referencia in meses_dato:
-                                    val_ult = meses_dato[mes_referencia]
+                                    val_ref = meses_dato[mes_referencia]
+                                elif meses_dato:
+                                    val_ref = meses_dato[max(meses_dato.keys())]
                                 else:
-                                    val_ult = meses_dato[max(meses_dato.keys())]
+                                    val_ref = 0.0
                                 for m in range(1, 13):
-                                    result[(cc_r, m)] = meses_dato.get(m, val_ult)
+                                    if m in meses_reales:
+                                        result[(cc_r, m)] = meses_dato.get(m, val_ref)
+                                    else:
+                                        result[(cc_r, m)] = val_ref
                             return result
 
                         refac_cc_mes = _fill_refac_yr(
-                            df_rm[df_rm['Fecha'].dt.year == year_ucp], mes_ref
+                            df_rm[df_rm['Fecha'].dt.year == year_ucp], mes_ref, meses_reales_ucp
                         )
-                        _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next], mes_ref)
+                        _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next], mes_ref, [])
                         if _rn:
                             refac_cc_mes_next = _rn
                         else:
