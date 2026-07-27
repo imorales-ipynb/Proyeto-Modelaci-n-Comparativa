@@ -1,11 +1,11 @@
 @echo off
 echo Iniciando entorno virtual...
-if not exist "venv\Scripts\activate" (
-    echo El entorno virtual no existe. Por favor ejecuta instalacion.bat primero.
+if not exist "C:\dev\venvs\proyecto-modelacion-comparativa\Scripts\activate" (
+    echo El entorno virtual no existe en C:\dev\venvs\proyecto-modelacion-comparativa
     pause
     exit
 )
-call venv\Scripts\activate
+call C:\dev\venvs\proyecto-modelacion-comparativa\Scripts\activate
 echo Iniciando aplicacion web...
 streamlit run app.py
 pause
