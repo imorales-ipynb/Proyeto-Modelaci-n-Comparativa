@@ -388,6 +388,407 @@ def _ultimo_mes_real(mod_pivot, var_venta, year_base):
     return max((c.month for c in cols_yr), default=12)
 
 
+def calcular_distribucion_ucp(ucp_file, path_mod):
+    """
+    Distribución de Costos UCP a partir del archivo crudo de Planificación
+    (columnas CC, COSTO, VENTA, MES/AÑO) y una modelación (con División TRANSP.,
+    costo del CC 138 y, opcionalmente, hoja Refacturación).
+
+    Calcula el año real (tomado del archivo UCP) y el año siguiente (arrastre),
+    con Refacturación (arrastrada desde el mes de referencia) y Diferencial
+    (contra el costo real del CC 138) ya aplicados.
+
+    Usado por 'Distribución Costos UCP' y por el 'Consolidado' — una sola
+    implementación para que ambos módulos queden siempre consistentes.
+
+    Lanza ValueError con un mensaje apto para mostrar al usuario si el archivo
+    UCP no es válido o no se puede interpretar.
+    """
+    # ── 1. Parsear archivo UCP (CC, COSTO, VENTA, MES/AÑO) ──
+    df_ucp = pd.read_excel(ucp_file)
+    df_ucp.columns = [
+        str(c).strip().upper()
+            .replace(' ', '_').replace('/', '_')
+            .replace('Á', 'A').replace('É', 'E').replace('Í', 'I')
+            .replace('Ó', 'O').replace('Ú', 'U').replace('Ñ', 'N')
+        for c in df_ucp.columns
+    ]
+    rename_ucp = {}
+    seen_u = set()
+    for c in df_ucp.columns:
+        if c == 'CC' and 'CC' not in seen_u:
+            rename_ucp[c] = 'CC'; seen_u.add('CC')
+        elif 'COSTO' in c and 'COSTO' not in seen_u:
+            rename_ucp[c] = 'COSTO'; seen_u.add('COSTO')
+        elif 'VENTA' in c and 'VENTA' not in seen_u:
+            rename_ucp[c] = 'VENTA'; seen_u.add('VENTA')
+        elif ('MES' in c or 'ANO' in c or 'PERIODO' in c or 'FECHA' in c) and 'MESANIO' not in seen_u:
+            rename_ucp[c] = 'MESANIO'; seen_u.add('MESANIO')
+    df_ucp = df_ucp.rename(columns=rename_ucp)
+
+    for col in ['CC', 'COSTO', 'VENTA', 'MESANIO']:
+        if col not in df_ucp.columns:
+            raise ValueError(f"El archivo UCP no tiene la columna '{col}'. Descarga la plantilla de referencia.")
+
+    def _norm_cc(v):
+        s = str(v).strip()
+        try:
+            return str(int(float(s)))
+        except Exception:
+            return s
+
+    df_ucp['CC']    = df_ucp['CC'].apply(_norm_cc)
+    df_ucp['COSTO'] = pd.to_numeric(df_ucp['COSTO'], errors='coerce').fillna(0)
+    df_ucp['VENTA'] = pd.to_numeric(df_ucp['VENTA'], errors='coerce').fillna(0)
+
+    fecha_p = None
+    for fmt in ['%m-%Y', '%m/%Y', '%Y-%m-%d', '%Y-%m', '%d-%m-%Y', '%d/%m/%Y']:
+        _p = pd.to_datetime(df_ucp['MESANIO'], format=fmt, errors='coerce')
+        if _p.notna().sum() >= len(df_ucp) * 0.5:
+            fecha_p = _p; break
+    if fecha_p is None:
+        fecha_p = pd.to_datetime(df_ucp['MESANIO'], errors='coerce')
+    df_ucp['FECHA'] = fecha_p
+    df_ucp = df_ucp.dropna(subset=['FECHA'])
+    df_ucp['FECHA'] = df_ucp['FECHA'].dt.to_period('M').dt.to_timestamp()
+
+    if df_ucp.empty:
+        raise ValueError("No se pudo interpretar la columna MES/AÑO. Usa el formato MM-YYYY (ej: 01-2026).")
+
+    # ── 2. Agregar por (CC, mes): sumar COSTO y VENTA; derivar % ──
+    year_ucp  = int(df_ucp['FECHA'].dt.year.max())
+    year_next = year_ucp + 1
+    df_anio = df_ucp[df_ucp['FECHA'].dt.year == year_ucp].copy()
+    meses_reales_ucp = sorted(df_anio['FECHA'].dt.month.unique().tolist())
+    meses_proy_ucp   = sorted(set(range(1, 13)) - set(meses_reales_ucp))
+
+    # Mes de referencia (último mes real del UCP) — se usa tanto para el % Costo/Venta
+    # de los meses proyectados como para el arrastre de la Refacturación (mismo criterio para todos los CC).
+    mes_ref = 12 if 12 in meses_reales_ucp else (max(meses_reales_ucp) if meses_reales_ucp else None)
+
+    agg = (
+        df_anio.groupby(['CC', 'FECHA'])
+        .agg(COSTO_SUM=('COSTO', 'sum'), VENTA_SUM=('VENTA', 'sum'))
+        .reset_index()
+    )
+    agg['MES_NUM'] = agg['FECHA'].dt.month
+    agg['PCT']     = agg.apply(lambda r: safe_div(r['COSTO_SUM'], r['VENTA_SUM']), axis=1)
+
+    ccs_trans = sorted(agg['CC'].unique().tolist())
+    if not ccs_trans:
+        raise ValueError("No se encontraron CCs en el archivo UCP.")
+
+    pct_ucp = {(r['CC'], r['MES_NUM']): r['PCT'] for _, r in agg.iterrows()}
+
+    # ── 3. Cargar modelación: detectar División TRANSP., leer venta y costo 138 ──
+    df_mod_all = pd.read_excel(path_mod)
+    df_mod_all['CC'] = df_mod_all['CC'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    df_mod_all['Nombre Cliente'] = df_mod_all['Nombre Cliente'].astype(str).str.strip().str.upper()
+    df_mod_all['Tipo Modelo'] = (
+        df_mod_all['Tipo Modelo'].astype(str).str.strip().str.upper()
+        .replace('MODELACIÓN', 'MODELACION')
+    )
+    df_mod_all = df_mod_all[df_mod_all['Tipo Modelo'].isin(['MODELACION', 'INTERNO'])].copy()
+    df_mod_all['Variable'] = df_mod_all['Variable'].astype(str).str.strip().replace({
+        'Costo Alimento': 'Costo', 'Gasto Manipulación': 'Manipulación',
+        'Gasto Fijo': 'Fijo', 'Gasto Variable': 'Variable',
+        'Margen de Contribución': 'Margen'
+    })
+
+    div_col = next((c for c in df_mod_all.columns if 'divis' in str(c).lower()), None)
+    excl = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
+    if div_col:
+        excl = excl + [div_col]
+        df_mod_all[div_col] = df_mod_all[div_col].astype(str).str.strip().str.upper()
+    mcols = [c for c in df_mod_all.columns if c not in excl]
+
+    if div_col:
+        df_transp = df_mod_all[df_mod_all[div_col].str.contains('TRANSP', na=False)].copy()
+        ccs_trans = sorted(df_transp['CC'].unique().tolist())
+    else:
+        df_transp = df_mod_all.copy()
+        ccs_trans = sorted(df_mod_all['CC'].unique().tolist())
+        st.info("No se encontró la columna 'División' en la modelación. Se usan todos los CCs.")
+
+    ccs_ucp_no_mod = [cc for cc in sorted(agg['CC'].unique()) if cc not in ccs_trans]
+    if ccs_ucp_no_mod:
+        st.warning(f"CCs del Excel UCP no presentes como TRANSP. en la modelación: {', '.join(ccs_ucp_no_mod)}")
+
+    nombres_cc = df_transp.drop_duplicates('CC').set_index('CC')['Nombre Cliente'].to_dict()
+
+    # Venta por (CC, mes) — leer directamente de la modelación, sin proyecciones externas
+    df_venta_t = df_transp[df_transp['Variable'].apply(is_venta)].copy()
+    df_mv = pd.melt(df_venta_t, id_vars=['CC'], value_vars=mcols, var_name='Mes', value_name='Venta')
+    df_mv['Venta'] = pd.to_numeric(df_mv['Venta'], errors='coerce').fillna(0)
+    df_mv['Fecha'] = pd.to_datetime(df_mv['Mes'], format='%m-%Y', errors='coerce')
+    _na = df_mv['Fecha'].isna()
+    if _na.any():
+        df_mv.loc[_na, 'Fecha'] = pd.to_datetime(df_mv.loc[_na, 'Mes'], errors='coerce')
+    df_mv = df_mv.dropna(subset=['Fecha'])
+    df_mv = df_mv[df_mv['Fecha'].dt.year == year_ucp]
+    df_mv['MES_NUM'] = df_mv['Fecha'].dt.month
+    venta_cc_mes = df_mv.groupby(['CC', 'MES_NUM'])['Venta'].sum().to_dict()
+
+    # Venta año siguiente — misma lógica de proyección de 'Proyección 2027' (proyectar_venta)
+    venta_cc_mes_next = {}
+    meses_next_dates = [pd.Timestamp(year=year_next, month=m, day=1) for m in range(1, 13)]
+    for cc_n in ccs_trans:
+        df_cc_n = df_transp[df_transp['CC'] == cc_n].copy()
+        if df_cc_n.empty:
+            continue
+        df_melt_n = pd.melt(df_cc_n, id_vars=['CC', 'Variable'], value_vars=mcols, var_name='Mes', value_name='Valor')
+        df_melt_n['Valor'] = pd.to_numeric(df_melt_n['Valor'], errors='coerce').fillna(0)
+        df_melt_n['Fecha'] = pd.to_datetime(df_melt_n['Mes'], format='%m-%Y', errors='coerce')
+        _na_n = df_melt_n['Fecha'].isna()
+        if _na_n.any():
+            df_melt_n.loc[_na_n, 'Fecha'] = pd.to_datetime(df_melt_n.loc[_na_n, 'Mes'], errors='coerce')
+        df_melt_n = df_melt_n.dropna(subset=['Fecha'])
+        if df_melt_n.empty:
+            continue
+        year_base_n = int(df_melt_n['Fecha'].dt.year.min())
+        mod_pivot_n = df_melt_n.pivot_table(index='Variable', columns='Fecha', values='Valor', aggfunc='sum').fillna(0)
+        var_venta_n = next((v for v in mod_pivot_n.index if is_venta(v)), None)
+        if var_venta_n is None:
+            continue
+        tiene_temp_n, meses_temp_n = detectar_temporalidad(mod_pivot_n, var_venta_n)
+        var_pct_n, var_abs_n = calcular_variacion_oct_dic(mod_pivot_n, var_venta_n)
+        ultimo_mes_real_n = _ultimo_mes_real(mod_pivot_n, var_venta_n, year_base_n)
+        for d in meses_next_dates:
+            venta_cc_mes_next[(cc_n, d.month)] = proyectar_venta(
+                mod_pivot=mod_pivot_n, var_venta=var_venta_n, mes_num=d.month,
+                year_base=year_base_n, year_proy=year_next,
+                tiene_temporalidad=tiene_temp_n, meses_con_temporalidad=meses_temp_n,
+                variacion_pct_oct_dic=var_pct_n, variacion_abs_oct_dic=var_abs_n,
+                aumento_extra_pct=0.0, ultimo_mes_real=ultimo_mes_real_n
+            )
+
+    # Costo CC 138 desde la modelación
+    CC_138 = '138'
+    df_cc138 = df_mod_all[df_mod_all['CC'] == CC_138].copy()
+    costo_138_mes = {}
+    costo_138_mes_next = {}
+    if not df_cc138.empty:
+        var_c138 = next((v for v in df_cc138['Variable'].unique() if 'costo' in v.lower()), None)
+        if var_c138:
+            df_m138 = pd.melt(
+                df_cc138[df_cc138['Variable'] == var_c138],
+                id_vars=['CC'], value_vars=mcols, var_name='Mes', value_name='Costo'
+            )
+            df_m138['Costo'] = pd.to_numeric(df_m138['Costo'], errors='coerce').fillna(0)
+            df_m138['Fecha'] = pd.to_datetime(df_m138['Mes'], format='%m-%Y', errors='coerce')
+            _na138 = df_m138['Fecha'].isna()
+            if _na138.any():
+                df_m138.loc[_na138, 'Fecha'] = pd.to_datetime(df_m138.loc[_na138, 'Mes'], errors='coerce')
+            df_m138 = df_m138.dropna(subset=['Fecha'])
+            df_m138 = df_m138[df_m138['Fecha'].dt.year == year_ucp]
+            df_m138['MES_NUM'] = df_m138['Fecha'].dt.month
+            costo_138_mes = df_m138.groupby('MES_NUM')['Costo'].sum().apply(abs).to_dict()
+
+            # Costo 138 año siguiente — proyectar el Costo como variable principal
+            # (CC 138 no tiene Venta; se usa proyectar_venta sobre la variable Costo)
+            df_melt_138 = pd.melt(
+                df_cc138[df_cc138['Variable'] == var_c138],
+                id_vars=['CC', 'Variable'], value_vars=mcols, var_name='Mes', value_name='Valor'
+            )
+            df_melt_138['Valor'] = pd.to_numeric(df_melt_138['Valor'], errors='coerce').fillna(0)
+            df_melt_138['Fecha'] = pd.to_datetime(df_melt_138['Mes'], format='%m-%Y', errors='coerce')
+            _na138b = df_melt_138['Fecha'].isna()
+            if _na138b.any():
+                df_melt_138.loc[_na138b, 'Fecha'] = pd.to_datetime(df_melt_138.loc[_na138b, 'Mes'], errors='coerce')
+            df_melt_138 = df_melt_138.dropna(subset=['Fecha'])
+            if not df_melt_138.empty:
+                year_base_138 = int(df_melt_138['Fecha'].dt.year.min())
+                mod_piv_138 = df_melt_138.pivot_table(index='Variable', columns='Fecha', values='Valor', aggfunc='sum').fillna(0)
+                if var_c138 in mod_piv_138.index:
+                    tiene_tmp_138, meses_tmp_138 = detectar_temporalidad(mod_piv_138, var_c138)
+                    var_pct_138, var_abs_138 = calcular_variacion_oct_dic(mod_piv_138, var_c138)
+                    for d in meses_next_dates:
+                        costo_138_mes_next[d.month] = abs(proyectar_venta(
+                            mod_pivot=mod_piv_138, var_venta=var_c138, mes_num=d.month,
+                            year_base=year_base_138, year_proy=year_next,
+                            tiene_temporalidad=tiene_tmp_138, meses_con_temporalidad=meses_tmp_138,
+                            variacion_pct_oct_dic=var_pct_138, variacion_abs_oct_dic=var_abs_138,
+                            aumento_extra_pct=0.0
+                        ))
+
+    # Hoja Refacturación: CC × mes → monto a restar de la venta antes de calcular costo UCP
+    refac_cc_mes = {}
+    refac_cc_mes_next = {}
+    try:
+        xl_file = pd.ExcelFile(path_mod)
+        sheet_refac = next((s for s in xl_file.sheet_names if 'refac' in s.lower()), None)
+        if sheet_refac:
+            df_refac = pd.read_excel(path_mod, sheet_name=sheet_refac)
+            df_refac.columns = [str(c).strip() for c in df_refac.columns]
+            cc_col_r = next((c for c in df_refac.columns if c.upper() == 'CC'), df_refac.columns[0])
+            excl_r = [cc_col_r]
+            cas_col_r = next((c for c in df_refac.columns if 'casino' in c.lower() or 'nombre' in c.lower()), None)
+            if cas_col_r:
+                excl_r.append(cas_col_r)
+            rcols = [c for c in df_refac.columns if c not in excl_r]
+            df_rm = pd.melt(df_refac, id_vars=[cc_col_r], value_vars=rcols, var_name='Mes', value_name='Refac')
+            df_rm['Refac'] = pd.to_numeric(df_rm['Refac'], errors='coerce').fillna(0)
+            df_rm['Fecha'] = pd.to_datetime(df_rm['Mes'], format='%m-%Y', errors='coerce')
+            _na_r = df_rm['Fecha'].isna()
+            if _na_r.any():
+                df_rm.loc[_na_r, 'Fecha'] = pd.to_datetime(df_rm.loc[_na_r, 'Mes'], errors='coerce')
+            df_rm = df_rm.dropna(subset=['Fecha'])
+            df_rm['CC'] = df_rm[cc_col_r].apply(_norm_cc)
+            df_rm['MES_NUM'] = df_rm['Fecha'].dt.month
+
+            def _fill_refac_yr(df_yr, mes_referencia, meses_reales):
+                # Meses "reales" usan el dato de la hoja si existe; meses "proyectados"
+                # SIEMPRE replican el valor del mes de referencia, aunque la hoja ya
+                # traiga (otro) valor cargado para ese mes.
+                result = {}
+                if df_yr.empty:
+                    return result
+                base = df_yr.groupby(['CC', 'MES_NUM'])['Refac'].sum()
+                for cc_r in base.index.get_level_values('CC').unique():
+                    meses_dato = base[cc_r].to_dict()
+                    if mes_referencia is not None and mes_referencia in meses_dato:
+                        val_ref = meses_dato[mes_referencia]
+                    elif meses_dato:
+                        val_ref = meses_dato[max(meses_dato.keys())]
+                    else:
+                        val_ref = 0.0
+                    for m in range(1, 13):
+                        if m in meses_reales:
+                            result[(cc_r, m)] = meses_dato.get(m, val_ref)
+                        else:
+                            result[(cc_r, m)] = val_ref
+                return result
+
+            refac_cc_mes = _fill_refac_yr(
+                df_rm[df_rm['Fecha'].dt.year == year_ucp], mes_ref, meses_reales_ucp
+            )
+            _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next], mes_ref, [])
+            if _rn:
+                refac_cc_mes_next = _rn
+            else:
+                _ccs_r = {cc for (cc, _) in refac_cc_mes}
+                refac_cc_mes_next = {
+                    (cc_r, m): refac_cc_mes.get((cc_r, 12), 0.0)
+                    for cc_r in _ccs_r for m in range(1, 13)
+                }
+    except Exception:
+        pass  # sin hoja Refacturación → refac = 0 para todos
+
+    # ── 4. % de referencia para meses sin dato en el Excel UCP ──
+    nombre_mes_ref = MESES_ES_NOMBRES.get(mes_ref, str(mes_ref)) if mes_ref else '—'
+    pct_ref_cc = {cc_t: pct_ucp.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans} if mes_ref else {}
+
+    if mes_ref:
+        venta_tot_ref = sum(venta_cc_mes.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans)
+        refac_tot_ref = sum(refac_cc_mes.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans)
+        venta_net_ref = venta_tot_ref - refac_tot_ref
+        pct_138_ref   = safe_div(costo_138_mes.get(mes_ref, 0.0), venta_net_ref)
+    else:
+        pct_138_ref = 0.0
+
+    # ── 5. Construir tablas de resultados (año real) ──
+    resumen_t4 = []
+    detalle_t4 = []
+    for mes_n in range(1, 13):
+        es_proy     = mes_n not in meses_reales_ucp
+        venta_tot_m = 0.0
+        refac_tot_m = 0.0
+        vnet_tot_m  = 0.0
+        costo_tot_m = 0.0
+        filas_mes   = []
+        for cc_t in ccs_trans:
+            v_cc = venta_cc_mes.get((cc_t, mes_n), 0.0)
+            if v_cc == 0:
+                continue
+            refac  = refac_cc_mes.get((cc_t, mes_n), 0.0)
+            v_net  = v_cc - refac
+            pct_cc = pct_ucp.get((cc_t, mes_n), pct_ref_cc.get(cc_t, 0.0)) if not es_proy else pct_ref_cc.get(cc_t, 0.0)
+            c_cc   = pct_cc * v_net
+            venta_tot_m += v_cc
+            refac_tot_m += refac
+            vnet_tot_m  += v_net
+            costo_tot_m += c_cc
+            filas_mes.append({
+                'MES/AÑO': f"{mes_n:02d}-{year_ucp}", 'Tipo': 'Proyectado' if es_proy else 'Real',
+                'CC': cc_t, 'Nombre Casino': nombres_cc.get(cc_t, cc_t),
+                'Venta': v_cc, 'Refacturación': refac, 'Venta Neta': v_net,
+                'Costo UCP': c_cc, '% Costo/Venta': safe_div(c_cc, v_net),
+            })
+        costo_138_m   = costo_138_mes.get(mes_n, pct_138_ref * vnet_tot_m)
+        diferencial_m = costo_138_m - costo_tot_m
+        for fila in filas_mes:
+            cargo = safe_div(fila['Costo UCP'], costo_tot_m) * diferencial_m
+            fila['Cargo Diferencial']   = cargo
+            fila['Costo Final']         = fila['Costo UCP'] + cargo
+            fila['% Costo Final/Venta'] = safe_div(fila['Costo Final'], fila['Venta Neta'])
+        detalle_t4.extend(filas_mes)
+        resumen_t4.append({
+            'MES/AÑO': f"{mes_n:02d}-{year_ucp}", 'Tipo': 'Proyectado' if es_proy else 'Real',
+            'Venta Total Transportados': venta_tot_m, 'Refacturación Total': refac_tot_m,
+            'Venta Neta Transportados': vnet_tot_m, 'Costo Total UCP': costo_tot_m,
+            '% Costo/Venta (UCP)': safe_div(costo_tot_m, vnet_tot_m),
+            'Costo CC 138 (Modelación)': costo_138_m, '% Costo CC138/Venta': safe_div(costo_138_m, vnet_tot_m),
+            'Diferencial': diferencial_m,
+        })
+
+    # ── 5b. Proyección año siguiente ──
+    resumen_next = []
+    detalle_next = []
+    for mes_n in range(1, 13):
+        venta_tot_m = 0.0
+        refac_tot_m = 0.0
+        vnet_tot_m  = 0.0
+        costo_tot_m = 0.0
+        filas_mes   = []
+        for cc_t in ccs_trans:
+            v_cc = venta_cc_mes_next.get((cc_t, mes_n), 0.0)
+            if v_cc == 0:
+                continue
+            refac  = refac_cc_mes_next.get((cc_t, mes_n), 0.0)
+            v_net  = v_cc - refac
+            pct_cc = pct_ref_cc.get(cc_t, 0.0)
+            c_cc   = pct_cc * v_net
+            venta_tot_m += v_cc
+            refac_tot_m += refac
+            vnet_tot_m  += v_net
+            costo_tot_m += c_cc
+            filas_mes.append({
+                'MES/AÑO': f"{mes_n:02d}-{year_next}", 'Tipo': 'Proyectado',
+                'CC': cc_t, 'Nombre Casino': nombres_cc.get(cc_t, cc_t),
+                'Venta': v_cc, 'Refacturación': refac, 'Venta Neta': v_net,
+                'Costo UCP': c_cc, '% Costo/Venta': safe_div(c_cc, v_net),
+            })
+        costo_138_m   = costo_138_mes_next.get(mes_n, pct_138_ref * vnet_tot_m)
+        diferencial_m = costo_138_m - costo_tot_m
+        for fila in filas_mes:
+            cargo = safe_div(fila['Costo UCP'], costo_tot_m) * diferencial_m
+            fila['Cargo Diferencial']   = cargo
+            fila['Costo Final']         = fila['Costo UCP'] + cargo
+            fila['% Costo Final/Venta'] = safe_div(fila['Costo Final'], fila['Venta Neta'])
+        detalle_next.extend(filas_mes)
+        resumen_next.append({
+            'MES/AÑO': f"{mes_n:02d}-{year_next}", 'Tipo': 'Proyectado',
+            'Venta Total Transportados': venta_tot_m, 'Refacturación Total': refac_tot_m,
+            'Venta Neta Transportados': vnet_tot_m, 'Costo Total UCP': costo_tot_m,
+            '% Costo/Venta (UCP)': safe_div(costo_tot_m, vnet_tot_m),
+            'Costo CC 138 (Modelación)': costo_138_m, '% Costo CC138/Venta': safe_div(costo_138_m, vnet_tot_m),
+            'Diferencial': diferencial_m,
+        })
+
+    return {
+        'year_ucp': year_ucp, 'year_next': year_next,
+        'meses_reales_ucp': meses_reales_ucp, 'meses_proy_ucp': meses_proy_ucp,
+        'mes_ref': mes_ref, 'nombre_mes_ref': nombre_mes_ref,
+        'ccs_trans': ccs_trans, 'nombres_cc': nombres_cc, 'ccs_ucp_no_mod': ccs_ucp_no_mod,
+        'agg_ucp': agg, 'pct_ref_cc': pct_ref_cc,
+        'resumen_actual': resumen_t4, 'detalle_actual': detalle_t4,
+        'resumen_next': resumen_next, 'detalle_next': detalle_next,
+        'refac_cc_mes': refac_cc_mes, 'refac_cc_mes_next': refac_cc_mes_next,
+        'costo_138_mes': costo_138_mes, 'costo_138_mes_next': costo_138_mes_next,
+        'meses_reales_138': sorted(costo_138_mes.keys()),
+    }
+
+
 def render_temporalidad_info(tiene_temporalidad, meses_con_temporalidad):
     """Renderiza el bloque informativo de temporalidad."""
     MESES_ES = {
@@ -776,7 +1177,7 @@ with st.sidebar:
 # TAB 1: COMPARATIVA EVA vs MODELACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Comparativa EVA vs Modelación", "🔍 Visualizador y Proyección de Modelación", "🗓️ Proyección 2027 (Todos los CC)", "🚛 Distribución Costos UCP", "📅 Proyección Multi-Año"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Comparativa EVA vs Modelación", "🔍 Visualizador y Proyección de Modelación", "🗓️ Proyección 2027 (Todos los CC)", "🚛 Distribución Costos UCP", "📅 Proyección Multi-Año", "🧩 Consolidado UCP + Refacturación"])
 
 with tab1:
     st.header("Comparativa EVA vs Modelación")
@@ -1749,469 +2150,24 @@ with tab4:
 
     if mod_sel_t4 != "Seleccionar..." and ucp_file_t4 is not None:
         try:
-            # ── 1. Parsear archivo UCP (CC, COSTO, VENTA, MES/AÑO) ──
-            df_ucp_t4 = pd.read_excel(ucp_file_t4)
-            df_ucp_t4.columns = [
-                str(c).strip().upper()
-                    .replace(' ', '_').replace('/', '_')
-                    .replace('Á','A').replace('É','E').replace('Í','I')
-                    .replace('Ó','O').replace('Ú','U').replace('Ñ','N')
-                for c in df_ucp_t4.columns
-            ]
-            rename_ucp = {}
-            seen_u = set()
-            for c in df_ucp_t4.columns:
-                if c == 'CC' and 'CC' not in seen_u:
-                    rename_ucp[c] = 'CC'; seen_u.add('CC')
-                elif 'COSTO' in c and 'COSTO' not in seen_u:
-                    rename_ucp[c] = 'COSTO'; seen_u.add('COSTO')
-                elif 'VENTA' in c and 'VENTA' not in seen_u:
-                    rename_ucp[c] = 'VENTA'; seen_u.add('VENTA')
-                elif ('MES' in c or 'ANO' in c or 'PERIODO' in c or 'FECHA' in c) and 'MESANIO' not in seen_u:
-                    rename_ucp[c] = 'MESANIO'; seen_u.add('MESANIO')
-            df_ucp_t4 = df_ucp_t4.rename(columns=rename_ucp)
-
-            for col in ['CC', 'COSTO', 'VENTA', 'MESANIO']:
-                if col not in df_ucp_t4.columns:
-                    st.error(f"El archivo UCP no tiene la columna '{col}'. Descarga la plantilla de referencia.")
-                    st.stop()
-
-            def _norm_cc(v):
-                s = str(v).strip()
-                try:
-                    return str(int(float(s)))
-                except Exception:
-                    return s
-            df_ucp_t4['CC']    = df_ucp_t4['CC'].apply(_norm_cc)
-            df_ucp_t4['COSTO'] = pd.to_numeric(df_ucp_t4['COSTO'], errors='coerce').fillna(0)
-            df_ucp_t4['VENTA'] = pd.to_numeric(df_ucp_t4['VENTA'], errors='coerce').fillna(0)
-
-            fecha_p = None
-            for fmt in ['%m-%Y', '%m/%Y', '%Y-%m-%d', '%Y-%m', '%d-%m-%Y', '%d/%m/%Y']:
-                _p = pd.to_datetime(df_ucp_t4['MESANIO'], format=fmt, errors='coerce')
-                if _p.notna().sum() >= len(df_ucp_t4) * 0.5:
-                    fecha_p = _p; break
-            if fecha_p is None:
-                fecha_p = pd.to_datetime(df_ucp_t4['MESANIO'], errors='coerce')
-            df_ucp_t4['FECHA'] = fecha_p
-            df_ucp_t4 = df_ucp_t4.dropna(subset=['FECHA'])
-            df_ucp_t4['FECHA'] = df_ucp_t4['FECHA'].dt.to_period('M').dt.to_timestamp()
-
-            if df_ucp_t4.empty:
-                st.error("No se pudo interpretar la columna MES/AÑO. Usa el formato MM-YYYY (ej: 01-2026).")
-                st.stop()
-
-            # ── 2. Agregar por (CC, mes): sumar COSTO y VENTA; derivar % ──
-            year_ucp  = int(df_ucp_t4['FECHA'].dt.year.max())
-            year_next = year_ucp + 1
-            df_anio = df_ucp_t4[df_ucp_t4['FECHA'].dt.year == year_ucp].copy()
-            meses_reales_ucp = sorted(df_anio['FECHA'].dt.month.unique().tolist())
-            meses_proy_ucp   = sorted(set(range(1, 13)) - set(meses_reales_ucp))
-
-            # Mes de referencia (último mes real del UCP) — se usa tanto para el % Costo/Venta
-            # de los meses proyectados como para el arrastre de la Refacturación (mismo criterio para todos los CC).
-            mes_ref = 12 if 12 in meses_reales_ucp else (max(meses_reales_ucp) if meses_reales_ucp else None)
-
-            agg = (
-                df_anio.groupby(['CC', 'FECHA'])
-                .agg(COSTO_SUM=('COSTO', 'sum'), VENTA_SUM=('VENTA', 'sum'))
-                .reset_index()
+            resultado_ucp = calcular_distribucion_ucp(
+                ucp_file_t4, os.path.join(REPO_DIR, mod_sel_t4)
             )
-            agg['MES_NUM'] = agg['FECHA'].dt.month
-            agg['PCT']     = agg.apply(lambda r: safe_div(r['COSTO_SUM'], r['VENTA_SUM']), axis=1)
 
-            ccs_trans = sorted(agg['CC'].unique().tolist())
-            if not ccs_trans:
-                st.warning("No se encontraron CCs en el archivo UCP.")
-                st.stop()
-
-            # Lookups rápidos por (cc, mes)
-            costo_ucp  = {(r['CC'], r['MES_NUM']): r['COSTO_SUM'] for _, r in agg.iterrows()}
-            venta_ucp  = {(r['CC'], r['MES_NUM']): r['VENTA_SUM'] for _, r in agg.iterrows()}
-            pct_ucp    = {(r['CC'], r['MES_NUM']): r['PCT']       for _, r in agg.iterrows()}
-
-            # ── 3. Cargar modelación: detectar División TRANSP., leer venta y costo 138 ──
-            with st.spinner("Cargando modelación..."):
-                path_mod_t4 = os.path.join(REPO_DIR, mod_sel_t4)
-                df_mod_t4_all = pd.read_excel(path_mod_t4)
-                df_mod_t4_all['CC'] = df_mod_t4_all['CC'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-                df_mod_t4_all['Nombre Cliente'] = df_mod_t4_all['Nombre Cliente'].astype(str).str.strip().str.upper()
-                df_mod_t4_all['Tipo Modelo'] = (
-                    df_mod_t4_all['Tipo Modelo'].astype(str).str.strip().str.upper()
-                    .replace('MODELACIÓN', 'MODELACION')
-                )
-                df_mod_t4_all = df_mod_t4_all[
-                    df_mod_t4_all['Tipo Modelo'].isin(['MODELACION', 'INTERNO'])
-                ].copy()
-                df_mod_t4_all['Variable'] = df_mod_t4_all['Variable'].astype(str).str.strip().replace({
-                    'Costo Alimento': 'Costo', 'Gasto Manipulación': 'Manipulación',
-                    'Gasto Fijo': 'Fijo', 'Gasto Variable': 'Variable',
-                    'Margen de Contribución': 'Margen'
-                })
-
-                # Detectar columna División y excluirla de las columnas de mes
-                div_col = next((c for c in df_mod_t4_all.columns if 'divis' in str(c).lower()), None)
-                excl_t4 = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
-                if div_col:
-                    excl_t4 = excl_t4 + [div_col]
-                    df_mod_t4_all[div_col] = df_mod_t4_all[div_col].astype(str).str.strip().str.upper()
-                mcols_t4 = [c for c in df_mod_t4_all.columns if c not in excl_t4]
-
-                # Filtrar TRANSP.
-                if div_col:
-                    df_transp = df_mod_t4_all[df_mod_t4_all[div_col].str.contains('TRANSP', na=False)].copy()
-                    ccs_trans = sorted(df_transp['CC'].unique().tolist())
-                else:
-                    df_transp = df_mod_t4_all.copy()
-                    ccs_trans = sorted(df_mod_t4_all['CC'].unique().tolist())
-                    st.info("No se encontró la columna 'División' en la modelación. Se usan todos los CCs.")
-
-                ccs_ucp_no_mod = [cc for cc in sorted(agg['CC'].unique()) if cc not in ccs_trans]
-                if ccs_ucp_no_mod:
-                    st.warning(f"CCs del Excel UCP no presentes como TRANSP. en la modelación: {', '.join(ccs_ucp_no_mod)}")
-
-                # Nombres por CC
-                nombres_cc_t4 = (
-                    df_transp.drop_duplicates('CC').set_index('CC')['Nombre Cliente'].to_dict()
-                )
-
-                # Venta por (CC, mes) — leer directamente de la modelación, sin proyecciones externas
-                df_venta_t = df_transp[df_transp['Variable'].apply(is_venta)].copy()
-                df_mv = pd.melt(df_venta_t, id_vars=['CC'],
-                                value_vars=mcols_t4, var_name='Mes', value_name='Venta')
-                df_mv['Venta'] = pd.to_numeric(df_mv['Venta'], errors='coerce').fillna(0)
-                df_mv['Fecha'] = pd.to_datetime(df_mv['Mes'], format='%m-%Y', errors='coerce')
-                _na = df_mv['Fecha'].isna()
-                if _na.any():
-                    df_mv.loc[_na, 'Fecha'] = pd.to_datetime(df_mv.loc[_na, 'Mes'], errors='coerce')
-                df_mv = df_mv.dropna(subset=['Fecha'])
-                df_mv = df_mv[df_mv['Fecha'].dt.year == year_ucp]
-                df_mv['MES_NUM'] = df_mv['Fecha'].dt.month
-                # Suma por (CC, mes) para colapsar duplicados
-                venta_cc_mes = (
-                    df_mv.groupby(['CC', 'MES_NUM'])['Venta'].sum().to_dict()
-                )  # {(cc, mes_num): venta}
-
-                # Venta año siguiente — misma lógica de proyección del Tab 3 (proyectar_venta)
-                venta_cc_mes_next = {}
-                meses_next_dates = [pd.Timestamp(year=year_next, month=m, day=1) for m in range(1, 13)]
-                for cc_n in ccs_trans:
-                    df_cc_n = df_transp[df_transp['CC'] == cc_n].copy()
-                    if df_cc_n.empty:
-                        continue
-                    df_melt_n = pd.melt(
-                        df_cc_n, id_vars=['CC', 'Variable'],
-                        value_vars=mcols_t4, var_name='Mes', value_name='Valor'
-                    )
-                    df_melt_n['Valor'] = pd.to_numeric(df_melt_n['Valor'], errors='coerce').fillna(0)
-                    df_melt_n['Fecha'] = pd.to_datetime(df_melt_n['Mes'], format='%m-%Y', errors='coerce')
-                    _na_n = df_melt_n['Fecha'].isna()
-                    if _na_n.any():
-                        df_melt_n.loc[_na_n, 'Fecha'] = pd.to_datetime(
-                            df_melt_n.loc[_na_n, 'Mes'], errors='coerce')
-                    df_melt_n = df_melt_n.dropna(subset=['Fecha'])
-                    if df_melt_n.empty:
-                        continue
-                    year_base_n = int(df_melt_n['Fecha'].dt.year.min())
-                    mod_pivot_n = df_melt_n.pivot_table(
-                        index='Variable', columns='Fecha', values='Valor', aggfunc='sum'
-                    ).fillna(0)
-                    var_venta_n = next((v for v in mod_pivot_n.index if is_venta(v)), None)
-                    if var_venta_n is None:
-                        continue
-                    tiene_temp_n, meses_temp_n = detectar_temporalidad(mod_pivot_n, var_venta_n)
-                    var_pct_n, var_abs_n = calcular_variacion_oct_dic(mod_pivot_n, var_venta_n)
-                    ultimo_mes_real_n = _ultimo_mes_real(mod_pivot_n, var_venta_n, year_base_n)
-                    for d in meses_next_dates:
-                        venta_cc_mes_next[(cc_n, d.month)] = proyectar_venta(
-                            mod_pivot=mod_pivot_n,
-                            var_venta=var_venta_n,
-                            mes_num=d.month,
-                            year_base=year_base_n,
-                            year_proy=year_next,
-                            tiene_temporalidad=tiene_temp_n,
-                            meses_con_temporalidad=meses_temp_n,
-                            variacion_pct_oct_dic=var_pct_n,
-                            variacion_abs_oct_dic=var_abs_n,
-                            aumento_extra_pct=0.0,
-                            ultimo_mes_real=ultimo_mes_real_n
-                        )
-
-                # Costo CC 138 desde la modelación
-                CC_138 = '138'
-                df_cc138 = df_mod_t4_all[df_mod_t4_all['CC'] == CC_138].copy()
-                costo_138_mes = {}
-                costo_138_mes_next = {}
-                if not df_cc138.empty:
-                    var_c138 = next((v for v in df_cc138['Variable'].unique() if 'costo' in v.lower()), None)
-                    if var_c138:
-                        df_m138 = pd.melt(
-                            df_cc138[df_cc138['Variable'] == var_c138],
-                            id_vars=['CC'], value_vars=mcols_t4,
-                            var_name='Mes', value_name='Costo'
-                        )
-                        df_m138['Costo'] = pd.to_numeric(df_m138['Costo'], errors='coerce').fillna(0)
-                        df_m138['Fecha'] = pd.to_datetime(df_m138['Mes'], format='%m-%Y', errors='coerce')
-                        _na138 = df_m138['Fecha'].isna()
-                        if _na138.any():
-                            df_m138.loc[_na138, 'Fecha'] = pd.to_datetime(df_m138.loc[_na138, 'Mes'], errors='coerce')
-                        df_m138 = df_m138.dropna(subset=['Fecha'])
-                        df_m138 = df_m138[df_m138['Fecha'].dt.year == year_ucp]
-                        df_m138['MES_NUM'] = df_m138['Fecha'].dt.month
-                        costo_138_mes = (
-                            df_m138.groupby('MES_NUM')['Costo'].sum()
-                            .apply(abs).to_dict()
-                        )
-                        # Costo 138 año siguiente — proyectar el Costo como variable principal
-                        # (CC 138 no tiene Venta; se usa proyectar_venta sobre la variable Costo)
-                        df_melt_138 = pd.melt(
-                            df_cc138[df_cc138['Variable'] == var_c138],
-                            id_vars=['CC', 'Variable'],
-                            value_vars=mcols_t4, var_name='Mes', value_name='Valor'
-                        )
-                        df_melt_138['Valor'] = pd.to_numeric(df_melt_138['Valor'], errors='coerce').fillna(0)
-                        df_melt_138['Fecha'] = pd.to_datetime(df_melt_138['Mes'], format='%m-%Y', errors='coerce')
-                        _na138b = df_melt_138['Fecha'].isna()
-                        if _na138b.any():
-                            df_melt_138.loc[_na138b, 'Fecha'] = pd.to_datetime(
-                                df_melt_138.loc[_na138b, 'Mes'], errors='coerce')
-                        df_melt_138 = df_melt_138.dropna(subset=['Fecha'])
-                        if not df_melt_138.empty:
-                            year_base_138 = int(df_melt_138['Fecha'].dt.year.min())
-                            mod_piv_138 = df_melt_138.pivot_table(
-                                index='Variable', columns='Fecha', values='Valor', aggfunc='sum'
-                            ).fillna(0)
-                            if var_c138 in mod_piv_138.index:
-                                tiene_tmp_138, meses_tmp_138 = detectar_temporalidad(
-                                    mod_piv_138, var_c138)
-                                var_pct_138, var_abs_138 = calcular_variacion_oct_dic(
-                                    mod_piv_138, var_c138)
-                                for d in meses_next_dates:
-                                    costo_138_mes_next[d.month] = abs(proyectar_venta(
-                                        mod_pivot=mod_piv_138,
-                                        var_venta=var_c138,
-                                        mes_num=d.month,
-                                        year_base=year_base_138,
-                                        year_proy=year_next,
-                                        tiene_temporalidad=tiene_tmp_138,
-                                        meses_con_temporalidad=meses_tmp_138,
-                                        variacion_pct_oct_dic=var_pct_138,
-                                        variacion_abs_oct_dic=var_abs_138,
-                                        aumento_extra_pct=0.0
-                                    ))
-
-                # Hoja Refacturación: CC × mes → monto a restar de la venta antes de calcular costo UCP
-                refac_cc_mes = {}
-                refac_cc_mes_next = {}
-                try:
-                    xl_file = pd.ExcelFile(path_mod_t4)
-                    sheet_refac = next(
-                        (s for s in xl_file.sheet_names if 'refac' in s.lower()), None
-                    )
-                    if sheet_refac:
-                        df_refac = pd.read_excel(path_mod_t4, sheet_name=sheet_refac)
-                        df_refac.columns = [str(c).strip() for c in df_refac.columns]
-                        cc_col_r = next(
-                            (c for c in df_refac.columns if c.upper() == 'CC'),
-                            df_refac.columns[0]
-                        )
-                        excl_r = [cc_col_r]
-                        cas_col_r = next(
-                            (c for c in df_refac.columns
-                             if 'casino' in c.lower() or 'nombre' in c.lower()),
-                            None
-                        )
-                        if cas_col_r:
-                            excl_r.append(cas_col_r)
-                        rcols = [c for c in df_refac.columns if c not in excl_r]
-                        df_rm = pd.melt(
-                            df_refac, id_vars=[cc_col_r],
-                            value_vars=rcols, var_name='Mes', value_name='Refac'
-                        )
-                        df_rm['Refac'] = pd.to_numeric(df_rm['Refac'], errors='coerce').fillna(0)
-                        df_rm['Fecha'] = pd.to_datetime(df_rm['Mes'], format='%m-%Y', errors='coerce')
-                        _na_r = df_rm['Fecha'].isna()
-                        if _na_r.any():
-                            df_rm.loc[_na_r, 'Fecha'] = pd.to_datetime(
-                                df_rm.loc[_na_r, 'Mes'], errors='coerce'
-                            )
-                        df_rm = df_rm.dropna(subset=['Fecha'])
-                        df_rm['CC'] = df_rm[cc_col_r].apply(_norm_cc)
-                        df_rm['MES_NUM'] = df_rm['Fecha'].dt.month
-
-                        def _fill_refac_yr(df_yr, mes_referencia, meses_reales):
-                            # Meses "reales" usan el dato de la hoja si existe; meses "proyectados"
-                            # SIEMPRE replican el valor del mes de referencia, aunque la hoja ya
-                            # traiga (otro) valor cargado para ese mes.
-                            result = {}
-                            if df_yr.empty:
-                                return result
-                            base = df_yr.groupby(['CC', 'MES_NUM'])['Refac'].sum()
-                            for cc_r in base.index.get_level_values('CC').unique():
-                                meses_dato = base[cc_r].to_dict()
-                                if mes_referencia is not None and mes_referencia in meses_dato:
-                                    val_ref = meses_dato[mes_referencia]
-                                elif meses_dato:
-                                    val_ref = meses_dato[max(meses_dato.keys())]
-                                else:
-                                    val_ref = 0.0
-                                for m in range(1, 13):
-                                    if m in meses_reales:
-                                        result[(cc_r, m)] = meses_dato.get(m, val_ref)
-                                    else:
-                                        result[(cc_r, m)] = val_ref
-                            return result
-
-                        refac_cc_mes = _fill_refac_yr(
-                            df_rm[df_rm['Fecha'].dt.year == year_ucp], mes_ref, meses_reales_ucp
-                        )
-                        _rn = _fill_refac_yr(df_rm[df_rm['Fecha'].dt.year == year_next], mes_ref, [])
-                        if _rn:
-                            refac_cc_mes_next = _rn
-                        else:
-                            # Arrastre: último mes de 2026 aplanado para todos los meses de 2027
-                            _ccs_r = {cc for (cc, _) in refac_cc_mes}
-                            refac_cc_mes_next = {
-                                (cc_r, m): refac_cc_mes.get((cc_r, 12),
-                                    refac_cc_mes.get((cc_r,
-                                        max((mm for (c, mm) in refac_cc_mes if c == cc_r), default=1)
-                                    ), 0.0))
-                                for cc_r in _ccs_r
-                                for m in range(1, 13)
-                            }
-                except Exception:
-                    pass  # sin hoja Refacturación → refac = 0 para todos
-
-            # ── 4. % de referencia para meses sin dato en el Excel UCP ──
-            nombre_mes_ref = MESES_ES_NOMBRES.get(mes_ref, str(mes_ref)) if mes_ref else '—'
-
-            pct_ref_cc = {cc_t: pct_ucp.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans} if mes_ref else {}
-
-            if mes_ref:
-                venta_tot_ref = sum(venta_cc_mes.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans)
-                refac_tot_ref = sum(refac_cc_mes.get((cc_t, mes_ref), 0.0) for cc_t in ccs_trans)
-                venta_net_ref = venta_tot_ref - refac_tot_ref
-                pct_138_ref   = safe_div(costo_138_mes.get(mes_ref, 0.0), venta_net_ref)
-            else:
-                pct_138_ref = 0.0
-
-            # ── 5. Construir tablas de resultados ──
-            resumen_t4 = []
-            detalle_t4 = []
-
-            for mes_n in range(1, 13):
-                es_proy     = mes_n not in meses_reales_ucp
-                venta_tot_m = 0.0
-                refac_tot_m = 0.0
-                vnet_tot_m  = 0.0
-                costo_tot_m = 0.0
-                filas_mes   = []
-
-                for cc_t in ccs_trans:
-                    v_cc   = venta_cc_mes.get((cc_t, mes_n), 0.0)
-                    if v_cc == 0:
-                        continue
-                    refac  = refac_cc_mes.get((cc_t, mes_n), 0.0)
-                    v_net  = v_cc - refac
-                    pct_cc = pct_ucp.get((cc_t, mes_n), pct_ref_cc.get(cc_t, 0.0)) if not es_proy else pct_ref_cc.get(cc_t, 0.0)
-                    c_cc   = pct_cc * v_net
-                    venta_tot_m += v_cc
-                    refac_tot_m += refac
-                    vnet_tot_m  += v_net
-                    costo_tot_m += c_cc
-                    filas_mes.append({
-                        'MES/AÑO':        f"{mes_n:02d}-{year_ucp}",
-                        'Tipo':           'Proyectado' if es_proy else 'Real',
-                        'CC':             cc_t,
-                        'Nombre Casino':  nombres_cc_t4.get(cc_t, cc_t),
-                        'Venta':          v_cc,
-                        'Refacturación':  refac,
-                        'Venta Neta':     v_net,
-                        'Costo UCP':      c_cc,
-                        '% Costo/Venta':  safe_div(c_cc, v_net),
-                    })
-
-                costo_138_m  = costo_138_mes.get(mes_n, pct_138_ref * vnet_tot_m)
-                diferencial_m = costo_138_m - costo_tot_m
-
-                # Distribuir diferencial proporcional al Costo UCP de cada CC sobre el total del mes
-                for fila in filas_mes:
-                    cargo = safe_div(fila['Costo UCP'], costo_tot_m) * diferencial_m
-                    fila['Cargo Diferencial']    = cargo
-                    fila['Costo Final']          = fila['Costo UCP'] + cargo
-                    fila['% Costo Final/Venta']  = safe_div(fila['Costo Final'], fila['Venta Neta'])
-                detalle_t4.extend(filas_mes)
-
-                resumen_t4.append({
-                    'MES/AÑO':                    f"{mes_n:02d}-{year_ucp}",
-                    'Tipo':                       'Proyectado' if es_proy else 'Real',
-                    'Venta Total Transportados':  venta_tot_m,
-                    'Refacturación Total':         refac_tot_m,
-                    'Venta Neta Transportados':   vnet_tot_m,
-                    'Costo Total UCP':            costo_tot_m,
-                    '% Costo/Venta (UCP)':        safe_div(costo_tot_m, vnet_tot_m),
-                    'Costo CC 138 (Modelación)':  costo_138_m,
-                    '% Costo CC138/Venta':        safe_div(costo_138_m, vnet_tot_m),
-                    'Diferencial':                diferencial_m,
-                })
-
-            # ── 5b. Proyección año siguiente ──
-            resumen_next = []
-            detalle_next = []
-
-            for mes_n in range(1, 13):
-                venta_tot_m = 0.0
-                refac_tot_m = 0.0
-                vnet_tot_m  = 0.0
-                costo_tot_m = 0.0
-                filas_mes   = []
-
-                for cc_t in ccs_trans:
-                    v_cc   = venta_cc_mes_next.get((cc_t, mes_n), 0.0)
-                    if v_cc == 0:
-                        continue
-                    refac  = refac_cc_mes_next.get((cc_t, mes_n), 0.0)
-                    v_net  = v_cc - refac
-                    pct_cc = pct_ref_cc.get(cc_t, 0.0)
-                    c_cc   = pct_cc * v_net
-                    venta_tot_m += v_cc
-                    refac_tot_m += refac
-                    vnet_tot_m  += v_net
-                    costo_tot_m += c_cc
-                    filas_mes.append({
-                        'MES/AÑO':        f"{mes_n:02d}-{year_next}",
-                        'Tipo':           'Proyectado',
-                        'CC':             cc_t,
-                        'Nombre Casino':  nombres_cc_t4.get(cc_t, cc_t),
-                        'Venta':          v_cc,
-                        'Refacturación':  refac,
-                        'Venta Neta':     v_net,
-                        'Costo UCP':      c_cc,
-                        '% Costo/Venta':  safe_div(c_cc, v_net),
-                    })
-
-                costo_138_m  = costo_138_mes_next.get(mes_n, pct_138_ref * vnet_tot_m)
-                diferencial_m = costo_138_m - costo_tot_m
-
-                for fila in filas_mes:
-                    cargo = safe_div(fila['Costo UCP'], costo_tot_m) * diferencial_m
-                    fila['Cargo Diferencial']   = cargo
-                    fila['Costo Final']         = fila['Costo UCP'] + cargo
-                    fila['% Costo Final/Venta'] = safe_div(fila['Costo Final'], fila['Venta Neta'])
-                detalle_next.extend(filas_mes)
-
-                resumen_next.append({
-                    'MES/AÑO':                    f"{mes_n:02d}-{year_next}",
-                    'Tipo':                       'Proyectado',
-                    'Venta Total Transportados':  venta_tot_m,
-                    'Refacturación Total':         refac_tot_m,
-                    'Venta Neta Transportados':   vnet_tot_m,
-                    'Costo Total UCP':            costo_tot_m,
-                    '% Costo/Venta (UCP)':        safe_div(costo_tot_m, vnet_tot_m),
-                    'Costo CC 138 (Modelación)':  costo_138_m,
-                    '% Costo CC138/Venta':        safe_div(costo_138_m, vnet_tot_m),
-                    'Diferencial':                diferencial_m,
-                })
+            year_ucp         = resultado_ucp['year_ucp']
+            year_next        = resultado_ucp['year_next']
+            meses_reales_ucp = resultado_ucp['meses_reales_ucp']
+            mes_ref          = resultado_ucp['mes_ref']
+            nombre_mes_ref   = resultado_ucp['nombre_mes_ref']
+            ccs_trans        = resultado_ucp['ccs_trans']
+            nombres_cc_t4    = resultado_ucp['nombres_cc']
+            agg              = resultado_ucp['agg_ucp']
+            pct_ref_cc       = resultado_ucp['pct_ref_cc']
+            resumen_t4       = resultado_ucp['resumen_actual']
+            detalle_t4       = resultado_ucp['detalle_actual']
+            resumen_next     = resultado_ucp['resumen_next']
+            detalle_next     = resultado_ucp['detalle_next']
+            costo_138_mes    = resultado_ucp['costo_138_mes']
 
             # ── 6. Mostrar resultados ──
             meses_reales_138 = sorted(costo_138_mes.keys())
@@ -2956,5 +2912,474 @@ with tab5:
 
         except Exception as e:
             st.error(f"Error en proyección multi-año: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 6: CONSOLIDADO — MODELACIÓN + REFACTURACIÓN + COSTO UCP
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab6:
+    st.header("Consolidado — Modelación + Refacturación + Costo UCP")
+    st.write(
+        "Unifica en un solo archivo la Modelación (base real + proyección del año siguiente, "
+        "misma lógica de 'Proyección 2027'), la **Refacturación** (tomada de la hoja de la "
+        "modelación y replicada desde el último mes real) y el **Costo UCP** (Costo Final calculado "
+        "con la misma lógica del módulo 'Distribución Costos UCP', a partir del archivo crudo de "
+        "Planificación). Aquí la columna 'Variable' se llama **'Item'**."
+    )
+
+    col_t6a, col_t6b = st.columns(2)
+    with col_t6a:
+        st.subheader("1. Modelación Base (con hoja Refacturación)")
+        if archivos_repo:
+            mod_sel_t6 = st.selectbox(
+                "Elige la modelación:",
+                options=["Seleccionar..."] + archivos_repo,
+                key="mod_sel_tab6"
+            )
+        else:
+            st.warning("Sube un archivo en la barra lateral.")
+            mod_sel_t6 = "Seleccionar..."
+    with col_t6b:
+        st.subheader("2. Archivo UCP (Planificación)")
+        ucp_dist_file_t6 = st.file_uploader(
+            "Sube el mismo archivo Excel UCP crudo (CC, COSTO, VENTA, MES/AÑO) que usas en 'Distribución Costos UCP'",
+            type=["xlsx", "xls"],
+            key="upload_ucp_dist_t6"
+        )
+
+    st.markdown("---")
+
+    if mod_sel_t6 != "Seleccionar..." and ucp_dist_file_t6 is not None:
+        try:
+            # ── 1. Cargar y normalizar modelación (misma lógica que Proyección 2027) ──
+            path_mod_t6 = os.path.join(REPO_DIR, mod_sel_t6)
+            df_base_t6 = pd.read_excel(path_mod_t6)
+
+            df_base_t6['CC'] = df_base_t6['CC'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            df_base_t6['Nombre Cliente'] = df_base_t6['Nombre Cliente'].astype(str).str.strip().str.upper()
+            df_base_t6['Variable'] = df_base_t6['Variable'].astype(str).str.strip()
+
+            mapping_vars_t6 = {
+                'Costo Alimento': 'Costo',
+                'Gasto Manipulación': 'Manipulación',
+                'Gasto Fijo': 'Fijo',
+                'Gasto Variable': 'Variable',
+                'Margen de Contribución': 'Margen'
+            }
+            df_base_t6['Variable'] = df_base_t6['Variable'].replace(mapping_vars_t6)
+
+            excluded_t6 = ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Variable']
+            excluded_t6 += [c for c in df_base_t6.columns if 'divis' in str(c).lower()]
+            month_cols_t6 = [c for c in df_base_t6.columns if c not in excluded_t6]
+
+            _anios_base_t6 = pd.to_datetime(pd.Series(month_cols_t6), format='%m-%Y', errors='coerce').dropna().dt.year
+            anio_base_t6 = int(_anios_base_t6.mode().iloc[0]) if not _anios_base_t6.empty else None
+            anio_proy_t6 = (anio_base_t6 + 1) if anio_base_t6 else None
+
+            def _norm_cc_t6(v):
+                s = str(v).strip()
+                try:
+                    return str(int(float(s)))
+                except Exception:
+                    return s
+
+            # ── Filtro de CC ──────────────────────────────────────────────────
+            st.subheader("3. Seleccionar Casinos")
+
+            _df_cc_t6 = (
+                df_base_t6[['CC', 'Nombre Cliente']]
+                .drop_duplicates(subset='CC')
+                .sort_values('CC')
+            )
+            _opciones_t6 = [f"{r['CC']} — {r['Nombre Cliente']}" for _, r in _df_cc_t6.iterrows()]
+            _map_t6 = {f"{r['CC']} — {r['Nombre Cliente']}": r['CC'] for _, r in _df_cc_t6.iterrows()}
+
+            col_t6c, col_t6d = st.columns([3, 1])
+            with col_t6d:
+                todos_t6 = st.checkbox("Seleccionar todos", value=True, key="todos_cc_t6")
+            with col_t6c:
+                sel_t6 = st.multiselect(
+                    "Casinos incluidos en el consolidado:",
+                    options=_opciones_t6,
+                    default=_opciones_t6 if todos_t6 else [],
+                    key="cc_sel_t6",
+                    placeholder="Elige uno o más casinos..."
+                )
+            ccs_seleccionados_t6 = [_map_t6[op] for op in sel_t6]
+
+            if ccs_seleccionados_t6:
+                st.caption(f"{len(ccs_seleccionados_t6)} de {len(_opciones_t6)} casinos seleccionados.")
+            else:
+                st.warning("Selecciona al menos un casino para habilitar el cálculo.")
+
+            if st.button(
+                "Generar Consolidado",
+                key="btn_calc_t6",
+                type="primary",
+                disabled=len(ccs_seleccionados_t6) == 0
+            ):
+                with st.spinner(f"Unificando Modelación + Refacturación + Costo UCP para {len(ccs_seleccionados_t6)} casino(s)..."):
+
+                    # ── 2. Calcular Distribución de Costos UCP (misma lógica que el módulo dedicado) ──
+                    resultado_ucp_t6 = calcular_distribucion_ucp(ucp_dist_file_t6, path_mod_t6)
+
+                    year_ucp_t6  = resultado_ucp_t6['year_ucp']
+                    year_next_t6 = resultado_ucp_t6['year_next']
+                    mes_ref_t6   = resultado_ucp_t6['mes_ref']
+
+                    if anio_base_t6 and year_ucp_t6 != anio_base_t6 and year_next_t6 != anio_base_t6:
+                        st.warning(
+                            f"El archivo UCP trae datos de {year_ucp_t6}/{year_next_t6}, "
+                            f"pero la modelación es {anio_base_t6}/{anio_proy_t6}. Revisa que sean los archivos correctos."
+                        )
+
+                    costo_final_ucp_t6 = {}   # (cc, año, mes) -> Costo Final
+                    ccs_con_ucp_t6 = set()
+                    for fila_u in resultado_ucp_t6['detalle_actual'] + resultado_ucp_t6['detalle_next']:
+                        mes_u, anio_u = fila_u['MES/AÑO'].split('-')
+                        costo_final_ucp_t6[(fila_u['CC'], int(anio_u), int(mes_u))] = fila_u['Costo Final']
+                        ccs_con_ucp_t6.add(fila_u['CC'])
+
+                    refac_cc_mes_t6      = resultado_ucp_t6['refac_cc_mes']
+                    refac_cc_mes_next_t6 = resultado_ucp_t6['refac_cc_mes_next']
+
+                    ccs_con_refac_t6 = (
+                        {cc for (cc, _m), v in refac_cc_mes_t6.items() if v}
+                        | {cc for (cc, _m), v in refac_cc_mes_next_t6.items() if v}
+                    )
+
+                    # ── 4. Loop principal por CC ──
+                    meses_proy_t6 = [pd.Timestamp(year=anio_proy_t6, month=m, day=1) for m in range(1, 13)] if anio_proy_t6 else []
+                    meses_proy_str_t6 = [f"{m:02d}-{anio_proy_t6}" for m in range(1, 13)] if anio_proy_t6 else []
+
+                    filas_base_t6 = []
+                    filas_proy_t6 = []
+                    filas_resumen_t6 = []
+
+                    for cc in ccs_seleccionados_t6:
+                        df_cc_t6 = df_base_t6[df_base_t6['CC'] == cc].copy()
+                        if df_cc_t6.empty:
+                            continue
+                        nombre_cc_t6 = df_cc_t6['Nombre Cliente'].iloc[0]
+
+                        df_melt_t6 = pd.melt(
+                            df_cc_t6, id_vars=['CC', 'Nombre Cliente', 'Variable'],
+                            value_vars=month_cols_t6, var_name='Mes', value_name='Valor'
+                        )
+                        df_melt_t6['Valor'] = pd.to_numeric(df_melt_t6['Valor'], errors='coerce').fillna(0)
+                        df_melt_t6['Fecha'] = pd.to_datetime(df_melt_t6['Mes'], format='%m-%Y', errors='coerce')
+                        _mask_t6 = df_melt_t6['Fecha'].isna()
+                        if _mask_t6.any():
+                            df_melt_t6.loc[_mask_t6, 'Fecha'] = pd.to_datetime(df_melt_t6.loc[_mask_t6, 'Mes'], errors='coerce')
+                        df_melt_t6 = df_melt_t6.dropna(subset=['Fecha'])
+
+                        fechas_t6 = sorted(df_melt_t6['Fecha'].dropna().unique())
+                        if not fechas_t6:
+                            continue
+                        year_base_cc_t6 = fechas_t6[0].year
+
+                        mod_pivot_t6 = df_melt_t6.pivot_table(
+                            index='Variable', columns='Fecha', values='Valor', aggfunc='sum'
+                        ).fillna(0)
+
+                        var_venta_t6 = next((v for v in mod_pivot_t6.index if is_venta(v)), 'Venta')
+
+                        tiene_temp_t6, meses_temp_t6 = detectar_temporalidad(mod_pivot_t6, var_venta_t6)
+                        var_pct_t6, var_abs_t6 = calcular_variacion_oct_dic(mod_pivot_t6, var_venta_t6)
+                        ultimo_mes_real_t6 = _ultimo_mes_real(mod_pivot_t6, var_venta_t6, year_base_cc_t6)
+
+                        col_dic_t6 = get_col_referencia(mod_pivot_t6, var_venta_t6)
+                        if col_dic_t6 is not None:
+                            val_fijo_dic_t6 = float(mod_pivot_t6.at['Fijo', col_dic_t6]) if 'Fijo' in mod_pivot_t6.index else 0.0
+                            val_manip_dic_t6 = float(mod_pivot_t6.at['Manipulación', col_dic_t6]) if 'Manipulación' in mod_pivot_t6.index else 0.0
+                            _vd_t6 = float(mod_pivot_t6.at[var_venta_t6, col_dic_t6]) if var_venta_t6 in mod_pivot_t6.index and mod_pivot_t6.at[var_venta_t6, col_dic_t6] > 0 else 1.0
+                            pct_costo_dic_t6 = safe_div(float(mod_pivot_t6.at['Costo', col_dic_t6]) if 'Costo' in mod_pivot_t6.index else 0.0, _vd_t6)
+                            pct_var_dic_t6 = safe_div(float(mod_pivot_t6.at['Variable', col_dic_t6]) if 'Variable' in mod_pivot_t6.index else 0.0, _vd_t6)
+                        else:
+                            _vp_t6 = float(mod_pivot_t6.loc[var_venta_t6].mean()) if var_venta_t6 in mod_pivot_t6.index and mod_pivot_t6.loc[var_venta_t6].mean() > 0 else 1.0
+                            val_fijo_dic_t6 = float(mod_pivot_t6.loc['Fijo'].mean()) if 'Fijo' in mod_pivot_t6.index else 0.0
+                            val_manip_dic_t6 = float(mod_pivot_t6.loc['Manipulación'].mean()) if 'Manipulación' in mod_pivot_t6.index else 0.0
+                            pct_costo_dic_t6 = safe_div(float(mod_pivot_t6.loc['Costo'].mean()) if 'Costo' in mod_pivot_t6.index else 0.0, _vp_t6)
+                            pct_var_dic_t6 = safe_div(float(mod_pivot_t6.loc['Variable'].mean()) if 'Variable' in mod_pivot_t6.index else 0.0, _vp_t6)
+
+                        # ── Proyección año siguiente (idéntica a 'Proyección 2027') ──
+                        valores_proy_t6 = {v: {} for v in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']}
+                        for d in meses_proy_t6:
+                            valores_proy_t6['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
+
+                            _col_base_t6 = next((c for c in mod_pivot_t6.columns if c.month == d.month), None)
+                            _venta_base_t6 = float(mod_pivot_t6.at[var_venta_t6, _col_base_t6]) if (_col_base_t6 is not None and var_venta_t6 in mod_pivot_t6.index) else 0.0
+                            _tiene_temp_d_t6 = tiene_temp_t6 and _venta_base_t6 > 0
+
+                            venta_p_t6 = proyectar_venta(
+                                mod_pivot=mod_pivot_t6,
+                                var_venta=var_venta_t6,
+                                mes_num=d.month,
+                                year_base=year_base_cc_t6,
+                                year_proy=anio_proy_t6,
+                                tiene_temporalidad=tiene_temp_t6,
+                                meses_con_temporalidad=meses_temp_t6,
+                                variacion_pct_oct_dic=var_pct_t6,
+                                variacion_abs_oct_dic=var_abs_t6,
+                                aumento_extra_pct=0.0,
+                                ultimo_mes_real=ultimo_mes_real_t6
+                            )
+                            valores_proy_t6['Venta'][d] = venta_p_t6
+
+                            if venta_p_t6 == 0:
+                                for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                    valores_proy_t6[var_c][d] = 0.0
+                                valores_proy_t6['Margen'][d] = 0.0
+                            else:
+                                costos_tot_t6 = 0.0
+                                for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                    val_p_t6 = proyectar_costos(
+                                        mod_pivot=mod_pivot_t6,
+                                        var=var_c,
+                                        venta_proyectada=venta_p_t6,
+                                        mes_num=d.month,
+                                        tiene_temporalidad=_tiene_temp_d_t6,
+                                        val_fijo_diciembre=val_fijo_dic_t6,
+                                        val_manipulacion_diciembre=val_manip_dic_t6,
+                                        pct_costo_diciembre=pct_costo_dic_t6,
+                                        pct_variable_diciembre=pct_var_dic_t6
+                                    )
+                                    valores_proy_t6[var_c][d] = val_p_t6
+                                    costos_tot_t6 += val_p_t6
+                                valores_proy_t6['Margen'][d] = venta_p_t6 - costos_tot_t6
+
+                        total_v_proy_t6 = sum(valores_proy_t6['Venta'][d] for d in meses_proy_t6)
+                        if total_v_proy_t6 == 0:
+                            continue
+
+                        # ── Valores año base, literales (tal cual la modelación) ──
+                        cols_base_ord_t6 = sorted([c for c in mod_pivot_t6.columns if c.year == anio_base_t6])
+                        valores_base_t6 = {}
+                        for var_i in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen']:
+                            valores_base_t6[var_i] = {
+                                c: (float(mod_pivot_t6.at[var_i, c]) if var_i in mod_pivot_t6.index else 0.0)
+                                for c in cols_base_ord_t6
+                            }
+                        if 'Margen' not in mod_pivot_t6.index:
+                            for c in cols_base_ord_t6:
+                                costos_c_t6 = sum(valores_base_t6[vc].get(c, 0.0) for vc in ['Costo', 'Manipulación', 'Fijo', 'Variable'])
+                                valores_base_t6['Margen'][c] = valores_base_t6['Venta'].get(c, 0.0) - costos_c_t6
+
+                        tiene_ucp_t6 = cc in ccs_con_ucp_t6
+                        tiene_refac_t6 = cc in ccs_con_refac_t6
+                        nombre_item_costo_t6 = 'Costo Directo' if tiene_ucp_t6 else 'Costo'
+
+                        items_base_t6 = ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen']
+
+                        # ── Filas año base ──
+                        for var_i in items_base_t6:
+                            nombre_item_t6 = nombre_item_costo_t6 if var_i == 'Costo' else var_i
+                            fila_base = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'MODELACIÓN {anio_base_t6}', 'Item': nombre_item_t6
+                            }
+                            for c in cols_base_ord_t6:
+                                ms = f"{c.month:02d}-{c.year}"
+                                v_val = valores_base_t6[var_i].get(c, 0.0)
+                                if var_i == 'Venta' and tiene_refac_t6:
+                                    v_val = v_val - refac_cc_mes_t6.get((cc, c.month), 0.0)
+                                fila_base[ms] = round(v_val, 2)
+                            fila_base['TOTAL'] = round(sum(fila_base[f"{c.month:02d}-{c.year}"] for c in cols_base_ord_t6), 2)
+                            filas_base_t6.append(fila_base)
+
+                        if tiene_refac_t6:
+                            fila_refac_base = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'MODELACIÓN {anio_base_t6}', 'Item': 'Refacturación'
+                            }
+                            for c in cols_base_ord_t6:
+                                ms = f"{c.month:02d}-{c.year}"
+                                fila_refac_base[ms] = round(refac_cc_mes_t6.get((cc, c.month), 0.0), 2)
+                            fila_refac_base['TOTAL'] = round(sum(refac_cc_mes_t6.get((cc, c.month), 0.0) for c in cols_base_ord_t6), 2)
+                            filas_base_t6.append(fila_refac_base)
+
+                        if tiene_ucp_t6:
+                            fila_ucp_base = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'MODELACIÓN {anio_base_t6}', 'Item': 'Costo'
+                            }
+                            for c in cols_base_ord_t6:
+                                ms = f"{c.month:02d}-{c.year}"
+                                fila_ucp_base[ms] = round(costo_final_ucp_t6.get((cc, anio_base_t6, c.month), 0.0), 2)
+                            fila_ucp_base['TOTAL'] = round(sum(costo_final_ucp_t6.get((cc, anio_base_t6, c.month), 0.0) for c in cols_base_ord_t6), 2)
+                            filas_base_t6.append(fila_ucp_base)
+
+                        # ── Filas año proyectado ──
+                        for var_i in items_base_t6:
+                            nombre_item_t6 = nombre_item_costo_t6 if var_i == 'Costo' else var_i
+                            fila_proy = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'PROYECCIÓN {anio_proy_t6}', 'Item': nombre_item_t6
+                            }
+                            for d, ms in zip(meses_proy_t6, meses_proy_str_t6):
+                                v_val = valores_proy_t6[var_i][d]
+                                if var_i == 'Venta' and tiene_refac_t6:
+                                    v_val = v_val - refac_cc_mes_next_t6.get((cc, d.month), 0.0)
+                                fila_proy[ms] = round(v_val, 2)
+                            fila_proy['TOTAL'] = round(sum(fila_proy[ms] for ms in meses_proy_str_t6), 2)
+                            filas_proy_t6.append(fila_proy)
+
+                        if tiene_refac_t6:
+                            fila_refac_proy = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'PROYECCIÓN {anio_proy_t6}', 'Item': 'Refacturación'
+                            }
+                            for d, ms in zip(meses_proy_t6, meses_proy_str_t6):
+                                fila_refac_proy[ms] = round(refac_cc_mes_next_t6.get((cc, d.month), 0.0), 2)
+                            fila_refac_proy['TOTAL'] = round(sum(refac_cc_mes_next_t6.get((cc, d.month), 0.0) for d in meses_proy_t6), 2)
+                            filas_proy_t6.append(fila_refac_proy)
+
+                        if tiene_ucp_t6:
+                            fila_ucp_proy = {
+                                'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                                'Tipo Modelo': f'PROYECCIÓN {anio_proy_t6}', 'Item': 'Costo'
+                            }
+                            for d, ms in zip(meses_proy_t6, meses_proy_str_t6):
+                                fila_ucp_proy[ms] = round(costo_final_ucp_t6.get((cc, anio_proy_t6, d.month), 0.0), 2)
+                            fila_ucp_proy['TOTAL'] = round(sum(costo_final_ucp_t6.get((cc, anio_proy_t6, d.month), 0.0) for d in meses_proy_t6), 2)
+                            filas_proy_t6.append(fila_ucp_proy)
+
+                        fila_dias_proy = {
+                            'CC': cc, 'Nombre Cliente': nombre_cc_t6,
+                            'Tipo Modelo': f'PROYECCIÓN {anio_proy_t6}', 'Item': 'Días Hábiles'
+                        }
+                        for d, ms in zip(meses_proy_t6, meses_proy_str_t6):
+                            fila_dias_proy[ms] = int(valores_proy_t6['Días Hábiles'][d])
+                        fila_dias_proy['TOTAL'] = int(sum(valores_proy_t6['Días Hábiles'][d] for d in meses_proy_t6))
+                        filas_proy_t6.append(fila_dias_proy)
+
+                        # ── Fila resumen ──
+                        venta_bruta_proy_t6 = total_v_proy_t6
+                        refac_proy_t6 = sum(refac_cc_mes_next_t6.get((cc, d.month), 0.0) for d in meses_proy_t6) if tiene_refac_t6 else 0.0
+                        venta_neta_proy_t6 = venta_bruta_proy_t6 - refac_proy_t6
+                        margen_proy_t6 = sum(valores_proy_t6['Margen'][d] for d in meses_proy_t6)
+                        costo_ucp_proy_t6 = (
+                            sum(costo_final_ucp_t6.get((cc, anio_proy_t6, d.month), 0.0) for d in meses_proy_t6)
+                            if tiene_ucp_t6 else 0.0
+                        )
+                        filas_resumen_t6.append({
+                            'CC': cc,
+                            'Nombre Cliente': nombre_cc_t6,
+                            f'Venta Bruta {anio_proy_t6}': round(venta_bruta_proy_t6, 0),
+                            f'Refacturación {anio_proy_t6}': round(refac_proy_t6, 0),
+                            f'Venta Neta {anio_proy_t6}': round(venta_neta_proy_t6, 0),
+                            f'Margen {anio_proy_t6}': round(margen_proy_t6, 0),
+                            f'Costo UCP {anio_proy_t6}': round(costo_ucp_proy_t6, 0),
+                            'Tiene UCP': 'Sí' if tiene_ucp_t6 else 'No',
+                            'Tiene Refacturación': 'Sí' if tiene_refac_t6 else 'No',
+                        })
+
+                if filas_base_t6 or filas_proy_t6:
+                    st.session_state['t6_base'] = pd.DataFrame(filas_base_t6)
+                    st.session_state['t6_proy'] = pd.DataFrame(filas_proy_t6)
+                    st.session_state['t6_resumen'] = pd.DataFrame(filas_resumen_t6)
+                    st.session_state['t6_meses_proy_str'] = meses_proy_str_t6
+                    st.session_state['t6_anio_base'] = anio_base_t6
+                    st.session_state['t6_anio_proy'] = anio_proy_t6
+                    st.session_state['t6_mes_ref'] = mes_ref_t6
+                else:
+                    st.session_state.pop('t6_base', None)
+                    st.session_state.pop('t6_proy', None)
+                    st.session_state.pop('t6_resumen', None)
+                    st.warning("No se encontraron datos procesables en los casinos seleccionados.")
+
+            # ── Resultados (persisten en session_state) ──────────────────────
+            if st.session_state.get('t6_base') is not None:
+                df_base_disp_t6 = st.session_state['t6_base']
+                df_proy_disp_t6 = st.session_state['t6_proy']
+                df_resumen_disp_t6 = st.session_state['t6_resumen']
+                meses_proy_str_disp_t6 = st.session_state['t6_meses_proy_str']
+                anio_base_disp_t6 = st.session_state['t6_anio_base']
+                anio_proy_disp_t6 = st.session_state['t6_anio_proy']
+                mes_ref_disp_t6 = st.session_state.get('t6_mes_ref')
+
+                ccs_ok_t6 = df_resumen_disp_t6['CC'].tolist()
+                st.success(f"Consolidado listo — {len(ccs_ok_t6)} casinos ({anio_base_disp_t6} + {anio_proy_disp_t6}).")
+
+                n_ucp_t6 = (df_resumen_disp_t6['Tiene UCP'] == 'Sí').sum()
+                n_refac_t6 = (df_resumen_disp_t6['Tiene Refacturación'] == 'Sí').sum()
+                st.caption(
+                    f"🚛 Casinos con Costo UCP: **{n_ucp_t6}** &nbsp;|&nbsp; "
+                    f"🧾 Casinos con Refacturación: **{n_refac_t6}** &nbsp;|&nbsp; "
+                    f"📌 Mes de referencia (real): **{MESES_ES_NOMBRES.get(mes_ref_disp_t6, '—')}**"
+                )
+
+                st.markdown(f"### 📊 Resumen — {anio_proy_disp_t6}")
+                st.dataframe(df_resumen_disp_t6.set_index('CC'), use_container_width=True)
+
+                st.markdown("### 📋 Detalle por Casino")
+                busqueda_t6 = st.text_input(
+                    "Buscar casino por CC o Nombre:",
+                    placeholder="Escribe el código CC o parte del nombre...",
+                    key="busqueda_t6"
+                )
+                termino_t6 = busqueda_t6.strip().lower()
+                if termino_t6:
+                    ccs_filtrados_t6 = [
+                        cc for cc in ccs_ok_t6
+                        if termino_t6 in cc.lower() or termino_t6 in df_resumen_disp_t6.loc[
+                            df_resumen_disp_t6['CC'] == cc, 'Nombre Cliente'
+                        ].iloc[0].lower()
+                    ]
+                else:
+                    ccs_filtrados_t6 = ccs_ok_t6
+
+                LIMITE_T6 = 10
+                ccs_mostrar_t6 = ccs_filtrados_t6[:LIMITE_T6]
+                if len(ccs_filtrados_t6) > LIMITE_T6:
+                    st.info(
+                        f"Mostrando {LIMITE_T6} de {len(ccs_filtrados_t6)} casinos. "
+                        "Usa el buscador para filtrar por CC o nombre."
+                    )
+                elif len(ccs_filtrados_t6) == 0:
+                    st.warning("No se encontraron casinos que coincidan con la búsqueda.")
+
+                for cc in ccs_mostrar_t6:
+                    df_cc_base_v = df_base_disp_t6[df_base_disp_t6['CC'] == cc].copy()
+                    df_cc_proy_v = df_proy_disp_t6[df_proy_disp_t6['CC'] == cc].copy()
+                    if df_cc_base_v.empty and df_cc_proy_v.empty:
+                        continue
+                    nombre_v_t6 = (
+                        df_cc_base_v['Nombre Cliente'].iloc[0] if not df_cc_base_v.empty
+                        else df_cc_proy_v['Nombre Cliente'].iloc[0]
+                    )
+                    with st.expander(f"📍 {cc} — {nombre_v_t6}"):
+                        if not df_cc_base_v.empty:
+                            st.markdown(f"**{anio_base_disp_t6} — Modelación base**")
+                            cols_base_show = ['Item'] + [
+                                c for c in df_cc_base_v.columns if c not in ['CC', 'Nombre Cliente', 'Tipo Modelo', 'Item']
+                            ]
+                            st.dataframe(df_cc_base_v[cols_base_show].set_index('Item'), use_container_width=True)
+                        if not df_cc_proy_v.empty:
+                            st.markdown(f"**{anio_proy_disp_t6} — Proyección**")
+                            cols_proy_show = ['Item'] + meses_proy_str_disp_t6 + ['TOTAL']
+                            st.dataframe(df_cc_proy_v[cols_proy_show].set_index('Item'), use_container_width=True)
+
+                # ── Exportar ──
+                st.markdown("---")
+                output_t6 = io.BytesIO()
+                with pd.ExcelWriter(output_t6, engine='openpyxl') as writer:
+                    df_base_disp_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_base_disp_t6}'[:31])
+                    df_proy_disp_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_proy_disp_t6}'[:31])
+                    df_resumen_disp_t6.to_excel(writer, index=False, sheet_name='Resumen')
+
+                st.download_button(
+                    label=f"📥 Descargar Consolidado {anio_base_disp_t6} + {anio_proy_disp_t6} (Excel)",
+                    data=output_t6.getvalue(),
+                    file_name=f"Consolidado_{anio_base_disp_t6}_{anio_proy_disp_t6}_UCP_Refacturacion.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_dl_t6"
+                )
+
+        except Exception as e:
+            st.error(f"Error al generar el consolidado: {e}")
             import traceback
             st.code(traceback.format_exc())
