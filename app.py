@@ -2944,15 +2944,19 @@ with tab6:
             mod_sel_t6 = "Seleccionar..."
     with col_t6b:
         st.subheader("2. Archivo UCP (Planificación)")
-        ucp_dist_file_t6 = st.file_uploader(
-            "Sube el mismo archivo Excel UCP crudo (CC, COSTO, VENTA, MES/AÑO) que usas en 'Distribución Costos UCP'",
-            type=["xlsx", "xls"],
-            key="upload_ucp_dist_t6"
-        )
+        if archivos_repo:
+            ucp_sel_t6 = st.selectbox(
+                "Elige el archivo UCP crudo (CC, COSTO, VENTA, MES/AÑO):",
+                options=["Seleccionar..."] + archivos_repo,
+                key="ucp_sel_tab6"
+            )
+        else:
+            st.warning("Sube un archivo en la barra lateral.")
+            ucp_sel_t6 = "Seleccionar..."
 
     st.markdown("---")
 
-    if mod_sel_t6 != "Seleccionar..." and ucp_dist_file_t6 is not None:
+    if mod_sel_t6 != "Seleccionar..." and ucp_sel_t6 != "Seleccionar...":
         try:
             # ── 1. Cargar y normalizar modelación (misma lógica que Proyección 2027) ──
             path_mod_t6 = os.path.join(REPO_DIR, mod_sel_t6)
@@ -3024,7 +3028,8 @@ with tab6:
                 with st.spinner(f"Unificando Modelación + Refacturación + Costo UCP para {len(ccs_seleccionados_t6)} casino(s)..."):
 
                     # ── 2. Calcular Distribución de Costos UCP (misma lógica que el módulo dedicado) ──
-                    resultado_ucp_t6 = calcular_distribucion_ucp(ucp_dist_file_t6, path_mod_t6)
+                    path_ucp_t6 = os.path.join(REPO_DIR, ucp_sel_t6)
+                    resultado_ucp_t6 = calcular_distribucion_ucp(path_ucp_t6, path_mod_t6)
 
                     year_ucp_t6  = resultado_ucp_t6['year_ucp']
                     year_next_t6 = resultado_ucp_t6['year_next']
@@ -3364,11 +3369,32 @@ with tab6:
                             st.dataframe(df_cc_proy_v[cols_proy_show].set_index('Item'), use_container_width=True)
 
                 # ── Exportar ──
+                # Para el Excel: solo nombre del mes (sin año) en las columnas, sin columna TOTAL
+                # y sin el Item 'Días Hábiles' (esto no afecta las tablas mostradas en pantalla).
+                def _preparar_export_t6(df):
+                    df_exp = df[df['Item'] != 'Días Hábiles'].copy()
+                    rename_meses = {}
+                    for col in df_exp.columns:
+                        if col in ('CC', 'Nombre Cliente', 'Tipo Modelo', 'Item', 'TOTAL'):
+                            continue
+                        try:
+                            mes_num = int(str(col).split('-')[0])
+                            rename_meses[col] = MESES_ES_NOMBRES.get(mes_num, col)
+                        except Exception:
+                            pass
+                    df_exp = df_exp.rename(columns=rename_meses)
+                    if 'TOTAL' in df_exp.columns:
+                        df_exp = df_exp.drop(columns=['TOTAL'])
+                    return df_exp
+
+                df_base_export_t6 = _preparar_export_t6(df_base_disp_t6)
+                df_proy_export_t6 = _preparar_export_t6(df_proy_disp_t6)
+
                 st.markdown("---")
                 output_t6 = io.BytesIO()
                 with pd.ExcelWriter(output_t6, engine='openpyxl') as writer:
-                    df_base_disp_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_base_disp_t6}'[:31])
-                    df_proy_disp_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_proy_disp_t6}'[:31])
+                    df_base_export_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_base_disp_t6}'[:31])
+                    df_proy_export_t6.to_excel(writer, index=False, sheet_name=f'Consolidado {anio_proy_disp_t6}'[:31])
                     df_resumen_disp_t6.to_excel(writer, index=False, sheet_name='Resumen')
 
                 st.download_button(
