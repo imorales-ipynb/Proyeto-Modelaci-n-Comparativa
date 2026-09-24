@@ -2140,18 +2140,22 @@ with tab4:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="btn_dl_plantilla_ucp"
         )
-        ucp_file_t4 = st.file_uploader(
-            "Sube el archivo Excel UCP",
-            type=["xlsx", "xls"],
-            key="upload_ucp_t4"
-        )
+        if archivos_repo:
+            ucp_sel_t4 = st.selectbox(
+                "Elige el archivo UCP crudo (CC, COSTO, VENTA, MES/AÑO):",
+                options=["Seleccionar..."] + archivos_repo,
+                key="ucp_sel_tab4"
+            )
+        else:
+            st.warning("Sube un archivo en la barra lateral.")
+            ucp_sel_t4 = "Seleccionar..."
 
     st.markdown("---")
 
-    if mod_sel_t4 != "Seleccionar..." and ucp_file_t4 is not None:
+    if mod_sel_t4 != "Seleccionar..." and ucp_sel_t4 != "Seleccionar...":
         try:
             resultado_ucp = calcular_distribucion_ucp(
-                ucp_file_t4, os.path.join(REPO_DIR, mod_sel_t4)
+                os.path.join(REPO_DIR, ucp_sel_t4), os.path.join(REPO_DIR, mod_sel_t4)
             )
 
             year_ucp         = resultado_ucp['year_ucp']
@@ -3112,52 +3116,100 @@ with tab6:
 
                         # ── Proyección año siguiente (idéntica a 'Proyección 2027') ──
                         valores_proy_t6 = {v: {} for v in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen', 'Días Hábiles']}
-                        for d in meses_proy_t6:
-                            valores_proy_t6['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
 
-                            _col_base_t6 = next((c for c in mod_pivot_t6.columns if c.month == d.month), None)
-                            _venta_base_t6 = float(mod_pivot_t6.at[var_venta_t6, _col_base_t6]) if (_col_base_t6 is not None and var_venta_t6 in mod_pivot_t6.index) else 0.0
-                            _tiene_temp_d_t6 = tiene_temp_t6 and _venta_base_t6 > 0
+                        # Venta real del CC en el año base (define qué lógica de proyección usar)
+                        total_v_base_t6 = sum(
+                            float(mod_pivot_t6.at[var_venta_t6, c]) if var_venta_t6 in mod_pivot_t6.index else 0.0
+                            for c in mod_pivot_t6.columns if c.year == anio_base_t6
+                        )
+                        tiene_venta_t6 = total_v_base_t6 != 0
 
-                            venta_p_t6 = proyectar_venta(
-                                mod_pivot=mod_pivot_t6,
-                                var_venta=var_venta_t6,
-                                mes_num=d.month,
-                                year_base=year_base_cc_t6,
-                                year_proy=anio_proy_t6,
-                                tiene_temporalidad=tiene_temp_t6,
-                                meses_con_temporalidad=meses_temp_t6,
-                                variacion_pct_oct_dic=var_pct_t6,
-                                variacion_abs_oct_dic=var_abs_t6,
-                                aumento_extra_pct=0.0,
-                                ultimo_mes_real=ultimo_mes_real_t6
-                            )
-                            valores_proy_t6['Venta'][d] = venta_p_t6
+                        if not tiene_venta_t6:
+                            # CC sin Venta (ej. CC 138, u otras cuentas internas de costo/ajuste:
+                            # bonos, finiquitos, arriendos, amortizaciones, leyes, etc.). Se incluyen
+                            # igual. La lógica de proyección estándar (ancla en Octubre) no sirve aquí
+                            # porque varias de estas cuentas concentran su gasto en meses puntuales
+                            # (ej. Aguinaldo en Septiembre/Diciembre) con Octubre en $0 — daría $0
+                            # siempre. En su lugar, cada rubro repite el MISMO mes del año base con
+                            # un reajuste de 4%, que es lo esperable para bonos/cargos atados a un
+                            # mes calendario específico.
+                            for d in meses_proy_t6:
+                                valores_proy_t6['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
+                                valores_proy_t6['Venta'][d] = 0.0
 
-                            if venta_p_t6 == 0:
-                                for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
-                                    valores_proy_t6[var_c][d] = 0.0
-                                valores_proy_t6['Margen'][d] = 0.0
-                            else:
-                                costos_tot_t6 = 0.0
-                                for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
-                                    val_p_t6 = proyectar_costos(
-                                        mod_pivot=mod_pivot_t6,
-                                        var=var_c,
-                                        venta_proyectada=venta_p_t6,
-                                        mes_num=d.month,
-                                        tiene_temporalidad=_tiene_temp_d_t6,
-                                        val_fijo_diciembre=val_fijo_dic_t6,
-                                        val_manipulacion_diciembre=val_manip_dic_t6,
-                                        pct_costo_diciembre=pct_costo_dic_t6,
-                                        pct_variable_diciembre=pct_var_dic_t6
+                            costos_tot_sv_t6 = {d: 0.0 for d in meses_proy_t6}
+                            for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                for d in meses_proy_t6:
+                                    col_base_sv_t6 = next(
+                                        (c for c in mod_pivot_t6.columns
+                                         if c.year == anio_base_t6 and c.month == d.month), None
                                     )
-                                    valores_proy_t6[var_c][d] = val_p_t6
-                                    costos_tot_t6 += val_p_t6
-                                valores_proy_t6['Margen'][d] = venta_p_t6 - costos_tot_t6
+                                    val_base_sv_t6 = (
+                                        float(mod_pivot_t6.at[var_c, col_base_sv_t6])
+                                        if (col_base_sv_t6 is not None and var_c in mod_pivot_t6.index) else 0.0
+                                    )
+                                    val_p_sv_t6 = val_base_sv_t6 * 1.04 if val_base_sv_t6 != 0 else 0.0
+                                    valores_proy_t6[var_c][d] = val_p_sv_t6
+                                    costos_tot_sv_t6[d] += val_p_sv_t6
+
+                            for d in meses_proy_t6:
+                                valores_proy_t6['Margen'][d] = 0.0 - costos_tot_sv_t6[d]
+                        else:
+                            for d in meses_proy_t6:
+                                valores_proy_t6['Días Hábiles'][d] = get_dias_habiles(d.year, d.month)
+
+                                _col_base_t6 = next((c for c in mod_pivot_t6.columns if c.month == d.month), None)
+                                _venta_base_t6 = float(mod_pivot_t6.at[var_venta_t6, _col_base_t6]) if (_col_base_t6 is not None and var_venta_t6 in mod_pivot_t6.index) else 0.0
+                                _tiene_temp_d_t6 = tiene_temp_t6 and _venta_base_t6 > 0
+
+                                venta_p_t6 = proyectar_venta(
+                                    mod_pivot=mod_pivot_t6,
+                                    var_venta=var_venta_t6,
+                                    mes_num=d.month,
+                                    year_base=year_base_cc_t6,
+                                    year_proy=anio_proy_t6,
+                                    tiene_temporalidad=tiene_temp_t6,
+                                    meses_con_temporalidad=meses_temp_t6,
+                                    variacion_pct_oct_dic=var_pct_t6,
+                                    variacion_abs_oct_dic=var_abs_t6,
+                                    aumento_extra_pct=0.0,
+                                    ultimo_mes_real=ultimo_mes_real_t6
+                                )
+                                valores_proy_t6['Venta'][d] = venta_p_t6
+
+                                if venta_p_t6 == 0:
+                                    for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                        valores_proy_t6[var_c][d] = 0.0
+                                    valores_proy_t6['Margen'][d] = 0.0
+                                else:
+                                    costos_tot_t6 = 0.0
+                                    for var_c in ['Costo', 'Manipulación', 'Fijo', 'Variable']:
+                                        val_p_t6 = proyectar_costos(
+                                            mod_pivot=mod_pivot_t6,
+                                            var=var_c,
+                                            venta_proyectada=venta_p_t6,
+                                            mes_num=d.month,
+                                            tiene_temporalidad=_tiene_temp_d_t6,
+                                            val_fijo_diciembre=val_fijo_dic_t6,
+                                            val_manipulacion_diciembre=val_manip_dic_t6,
+                                            pct_costo_diciembre=pct_costo_dic_t6,
+                                            pct_variable_diciembre=pct_var_dic_t6
+                                        )
+                                        valores_proy_t6[var_c][d] = val_p_t6
+                                        costos_tot_t6 += val_p_t6
+                                    valores_proy_t6['Margen'][d] = venta_p_t6 - costos_tot_t6
 
                         total_v_proy_t6 = sum(valores_proy_t6['Venta'][d] for d in meses_proy_t6)
-                        if total_v_proy_t6 == 0:
+                        # Incluir el CC si tuvo movimiento en el año base o proyectado en CUALQUIER
+                        # item (Venta, Costo, Manipulación, Fijo, Variable o Margen) — no solo Venta.
+                        # Esto cubre tanto casinos que dejaron de operar durante el año (venta
+                        # histórica pero proyección en 0) como cuentas internas de costo/ajuste sin
+                        # Venta (bonos, finiquitos, amortizaciones, etc.).
+                        tiene_algun_dato_t6 = any(
+                            v in mod_pivot_t6.index and float(mod_pivot_t6.loc[v].sum()) != 0
+                            for v in ['Venta', 'Costo', 'Manipulación', 'Fijo', 'Variable', 'Margen']
+                        )
+                        if total_v_base_t6 == 0 and total_v_proy_t6 == 0 and not tiene_algun_dato_t6:
                             continue
 
                         # ── Valores año base, literales (tal cual la modelación) ──
@@ -3189,8 +3241,6 @@ with tab6:
                             for c in cols_base_ord_t6:
                                 ms = f"{c.month:02d}-{c.year}"
                                 v_val = valores_base_t6[var_i].get(c, 0.0)
-                                if var_i == 'Venta' and tiene_refac_t6:
-                                    v_val = v_val - refac_cc_mes_t6.get((cc, c.month), 0.0)
                                 fila_base[ms] = round(v_val, 2)
                             fila_base['TOTAL'] = round(sum(fila_base[f"{c.month:02d}-{c.year}"] for c in cols_base_ord_t6), 2)
                             filas_base_t6.append(fila_base)
@@ -3226,8 +3276,6 @@ with tab6:
                             }
                             for d, ms in zip(meses_proy_t6, meses_proy_str_t6):
                                 v_val = valores_proy_t6[var_i][d]
-                                if var_i == 'Venta' and tiene_refac_t6:
-                                    v_val = v_val - refac_cc_mes_next_t6.get((cc, d.month), 0.0)
                                 fila_proy[ms] = round(v_val, 2)
                             fila_proy['TOTAL'] = round(sum(fila_proy[ms] for ms in meses_proy_str_t6), 2)
                             filas_proy_t6.append(fila_proy)
